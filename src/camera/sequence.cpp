@@ -693,6 +693,43 @@ void Sequence_DeletePose(int idx) {
   s->poses.erase(s->poses.begin() + idx);
 }
 
+int Sequence_DuplicatePose(int poseIdx) {
+  CameraSequence *s = Sequence_Active();
+  if (!s || poseIdx < 0 || poseIdx >= (int)s->poses.size()) return -1;
+  PoseKeyframe k = s->poses[poseIdx]; // copy everything (pose, ease, lock, ...)
+
+  // Time placement: midpoint to the next-later keyframe (an insert you'll
+  // reshape), or +2s past the end when duplicating the last one (a hold).
+  float srcT = k.t;
+  float nextT = -1.0f;
+  for (const auto &p : s->poses)
+    if (p.t > srcT + 0.001f && (nextT < 0.0f || p.t < nextT)) nextT = p.t;
+  k.t = (nextT >= 0.0f) ? (srcT + nextT) * 0.5f : srcT + 2.0f;
+
+  // Nudge off any coincident keyframe so we don't create a zero-length segment.
+  for (const auto &p : s->poses)
+    if (fabsf(p.t - k.t) < 0.05f) k.t = p.t + 0.05f;
+
+  s->poses.push_back(k);
+  Sequence_SortByTime();
+  // Locate the copy post-sort by its (nudged-unique) time.
+  for (int i = 0; i < (int)s->poses.size(); ++i)
+    if (fabsf(s->poses[i].t - k.t) < 0.001f) return i;
+  return -1;
+}
+
+int Sequence_DistributeTimes() {
+  CameraSequence *s = Sequence_Active();
+  if (!s || (int)s->poses.size() < 3) return 0;
+  Sequence_SortByTime(); // make first/last meaningful even after hand edits
+  int n = (int)s->poses.size();
+  float t0 = s->poses.front().t, t1 = s->poses.back().t;
+  if (t1 - t0 < 0.01f) return 0;
+  for (int i = 1; i < n - 1; ++i)
+    s->poses[i].t = t0 + (t1 - t0) * (float)i / (float)(n - 1);
+  return n - 2;
+}
+
 void Sequence_AddEvent(EffectKind kind, float t, float value, bool ramp) {
   CameraSequence *s = EnsureActive();
   EffectEvent e = {t, kind, value, ramp};
@@ -738,7 +775,20 @@ void Sequence_SetCurrentTime(float t) {
   // scrub apply shouldn't animate jitter.
   CameraSequence *s = Sequence_Active();
   if (s && !s->poses.empty()) {
+    // Idle scrub: move the recorded vehicles to the scrub time FIRST, so an
+    // entity-LOCKED pose resolves its world coord against the vehicle where
+    // it will actually be shown — not against its previous playhead pose.
+    // (While playing, the tick drives the vehicles itself.)
+    if (!s_Playing) VehicleClip_ApplyAtTime(t, false);
     ApplyPoseAtTime(t, s);
+    // Idle scrub is a one-shot: route the push through the WORLD-coord path,
+    // never the attach path. Attaching would leave free-fly rotation-only
+    // (an attached cam ignores SET_CAM_COORD) — and attach+detach within one
+    // script frame never takes render effect anyway, so the camera would
+    // visibly stay put. Clearing the attach state BEFORE the push makes
+    // PushToEngine call SET_CAM_COORD with the resolved locked pose.
+    // Playback keeps the native attach (lag-free ride-along) untouched.
+    if (!s_Playing) SequenceDetachCamera();
     SequencePushToEngine(0.0f);
   }
 }
@@ -1717,6 +1767,10 @@ void Sequence_Tick(float dt) {
     float dur = Sequence_TotalDuration();
     if (s_PlaybackTime >= dur) {
       if (s->loop && dur > 0.0001f) {
+        // Fire any events still pending in the tail (s_LastTickTime, dur] BEFORE
+        // wrapping — otherwise resetting s_LastTickTime to 0 collapses the event
+        // window and events near the end of the loop are skipped every cycle.
+        DriveEvents(s, s_LastTickTime, dur, firstTick);
         s_PlaybackTime = fmodf(s_PlaybackTime, dur);
         s_LastTickTime = 0.0f;
         wrapped = true;
@@ -2046,6 +2100,12 @@ static void ParseSequenceJson(const char *data, int len, CameraSequence &seq) {
   ForEachArrayObject(data, end, "events", [&](const char *a, const char *b) {
     EffectEvent ev; ParseEventJson(a, b, ev); seq.events.push_back(ev);
   });
+  // The interpolators and event scan assume ascending time; a hand-edited or
+  // out-of-order file must not feed them a negative segment duration.
+  std::sort(seq.poses.begin(), seq.poses.end(),
+            [](const PoseKeyframe &a, const PoseKeyframe &b) { return a.t < b.t; });
+  std::sort(seq.events.begin(), seq.events.end(),
+            [](const EffectEvent &a, const EffectEvent &b) { return a.t < b.t; });
 }
 
 // Write sequence `idx` as a merged JSON file. The clip section uses the runtime

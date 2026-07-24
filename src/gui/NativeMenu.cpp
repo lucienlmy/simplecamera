@@ -502,7 +502,15 @@ void MenuController::editCurrentItem(int dir) {
   case ItemType::List:
     if (it.listIndexPtr && !it.listOptions.empty()) {
       int n = (int)it.listOptions.size();
-      *it.listIndexPtr = (*it.listIndexPtr + dir % n + n) % n;
+      // Normalize the current index into [0,n) first: the host var may already
+      // hold an out-of-range value (e.g. a hand-edited INI), and C++ % keeps the
+      // sign of the dividend, so cycling a negative index could otherwise write
+      // back a negative one.
+      int cur = *it.listIndexPtr % n;
+      if (cur < 0) cur += n;
+      int next = (cur + dir) % n;
+      if (next < 0) next += n;
+      *it.listIndexPtr = next;
       if (it.onChange) it.onChange(it);
       playSound("NAV_LEFT_RIGHT");
     }
@@ -570,7 +578,7 @@ void MenuController::beginValueEdit(int index) {
   Menu *m = Current();
   if (!m || index < 0 || index >= (int)m->items.size()) return;
   const MenuItem &it = m->items[index];
-  char buf[32] = {0};
+  char buf[48] = {0}; // %.6f of a large-magnitude float can need ~46 chars
   if (it.type == ItemType::Float && it.floatPtr) {
     int dec = it.fDecimals < 0 ? 0 : (it.fDecimals > 6 ? 6 : it.fDecimals);
     char fmt[8];

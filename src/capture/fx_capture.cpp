@@ -42,8 +42,13 @@ void FxCapture_Init() {
 
   s_block = (FxCaptureBlock *)MapViewOfFile(s_mapHandle, FILE_MAP_ALL_ACCESS, 0,
                                             0, sizeof(FxCaptureBlock));
-  if (!s_block)
+  if (!s_block) {
+    // Don't leak the mapping handle on the failure path — a later re-init would
+    // overwrite s_mapHandle and orphan this one.
+    CloseHandle(s_mapHandle);
+    s_mapHandle = nullptr;
     return;
+  }
 
   if (!alreadyExisted) {
     // We created it — zero everything and stamp the header.

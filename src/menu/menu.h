@@ -43,7 +43,6 @@ extern int g_RenderFlushFrames;
 extern int g_RenderBlurSamples;
 extern int g_RenderFormat;
 extern int g_RenderJpegQuality;
-extern float g_RenderSlowmo;
 extern float g_RenderHighlightBoost;
 extern int g_RenderChannelOrder;
 // Optional render time range (seconds). Render only [start, end] of the

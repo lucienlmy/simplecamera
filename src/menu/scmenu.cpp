@@ -85,13 +85,22 @@ static int s_editPose = -1;
 static int s_editEvent = -1;
 static struct { float t, posX, posY, posZ, pitch, yaw, roll, fov; int easeI, pathI; } s_pm;
 static struct { float t, value; int kindI; bool ramp; } s_em;
+// Workflow helpers: live keyframe preview + fast timeline navigation.
+static decltype(s_pm) s_pmPrev;      // change detect: re-preview edited keyframe
+static int s_kfNav = 1;              // root "Go to Keyframe" stepper (1-based)
+static int s_poseListHeaderRows = 0; // rows before the first keyframe row
+static int s_poseListPrevSel = -1;   // selection edge detect for browse preview
 static int s_editVeh = -1;                 // clip index open in the vehicle editor
 static VehicleClipSettings s_vm{};         // vehicle editor mirror (bound by menu)
 static bool s_seqPopRequested = false; // deferred Back() (delete-from-editor)
 static bool s_seqCloseRequested = false; // deferred full close (start a take)
 static DWORD s_seqDelArmed = 0;        // 2-press confirm for Delete Active
 static DWORD s_seqReloadArmed = 0;     // 2-press confirm for Reload from Disk
-static gtam::MenuItem *s_pEventValue = nullptr;
+// Index of the "Value" row inside g_SeqEventEdit.items (resolved each frame).
+// Storing an index rather than a MenuItem* is deliberate: g_SeqEventEdit.items
+// is a std::vector that reallocates as later rows are appended, which would
+// leave a cached pointer dangling.
+static int s_EventValueIdx = -1;
 
 // Render menu: the FPS / blur settings are non-linear preset cycles, so they
 // bind to mirror indices synced from the live (float/int) globals on entry.
@@ -124,15 +133,51 @@ static int RaycastEntityFromCamera() {
   float dy = cosf(yawRad) * cosf(pitchRad);
   float dz = sinf(pitchRad);
   float ex = px + dx * 1000.0f, ey = py + dy * 1000.0f, ez = pz + dz * 1000.0f;
+  // Ignore the player ped so the ray can't self-hit when the hidden ped is
+  // parked at the camera (Stream Around Camera) — but ONLY while on foot.
+  // The shape test extends the ignore to everything the ignored entity is
+  // attached to, so ignoring a ped who's sitting in a car silently made the
+  // player's own vehicle un-hittable. In a vehicle the ped is at the car,
+  // not at the camera, so there's nothing to self-hit — ignore nothing.
+  Ped player = PLAYER::PLAYER_PED_ID();
+  int ignore = PED::IS_PED_IN_ANY_VEHICLE(player, FALSE) ? 0 : player;
   int ray = invoke<int>(0x377906D8A31E5586, px, py, pz, ex, ey, ez, 30,
-                        PLAYER::PLAYER_PED_ID(), 7);
+                        ignore, 7);
   int hit = 0, ent = 0;
   Vector3 a{}, b{};
   invoke<int>(0x3D87450E15D98694, ray, &hit, &a, &b, &ent);
-  if (hit && ent != 0 && ENTITY::DOES_ENTITY_EXIST(ent) &&
-      (ENTITY::IS_ENTITY_A_PED(ent) || ENTITY::IS_ENTITY_A_VEHICLE(ent) ||
-       ENTITY::IS_ENTITY_AN_OBJECT(ent)))
-    return ent;
+  if (hit && ent != 0 && ENTITY::DOES_ENTITY_EXIST(ent)) {
+    // A hit on a seated ped resolves to their vehicle: option 7 ignores glass,
+    // so aiming "at a car" can clip the driver through the windshield — the
+    // car is what the user meant to lock.
+    if (ENTITY::IS_ENTITY_A_PED(ent) && PED::IS_PED_IN_ANY_VEHICLE(ent, FALSE)) {
+      int v = PED::GET_VEHICLE_PED_IS_IN(ent, FALSE);
+      if (v != 0 && ENTITY::DOES_ENTITY_EXIST(v)) return v;
+    }
+    if (ENTITY::IS_ENTITY_A_PED(ent) || ENTITY::IS_ENTITY_A_VEHICLE(ent) ||
+        ENTITY::IS_ENTITY_AN_OBJECT(ent))
+      return ent;
+  }
+  // Replay ghosts run with collision DISABLED, so the shape test passes
+  // straight through them and aiming at a recorded vehicle never locked.
+  // Fall back to a ray-proximity test against each spawned ghost: pick the
+  // nearest one whose center lies within a few meters of the aim ray.
+  int bestGhost = 0;
+  float bestT = 1e9f;
+  for (int i = 0; i < VehicleClip_Count(); ++i) {
+    int g = VehicleClip_GhostAt(i);
+    if (g == 0) continue;
+    Vector3 gp = ENTITY::GET_ENTITY_COORDS(g, TRUE);
+    float vx = gp.x - px, vy = gp.y - py, vz = gp.z - pz;
+    float tproj = vx * dx + vy * dy + vz * dz; // dir is unit-length
+    if (tproj < 0.5f || tproj > 1000.0f) continue; // behind us / out of range
+    float cx = px + dx * tproj - gp.x;
+    float cy = py + dy * tproj - gp.y;
+    float cz = pz + dz * tproj - gp.z;
+    float perp2 = cx * cx + cy * cy + cz * cz;
+    if (perp2 < 3.0f * 3.0f && tproj < bestT) { bestT = tproj; bestGhost = g; }
+  }
+  if (bestGhost != 0) return bestGhost;
   return 0;
 }
 
@@ -569,9 +614,21 @@ static void TogglePoseLock() {
     Sequence_CaptureLockForPose(p);
     SetStatusText(p.entityHandle != 0 ? "Locked to free-cam target" : "Lock failed");
   } else {
-    p.localOffsetX = p.localOffsetY = p.localOffsetZ = 0.0f;
-    p.lockEntPitch = p.lockEntYaw = p.lockEntRoll = 0.0f;
-    SetStatusText("Aim & lock in Free Camera first");
+    // No target picked yet — instead of a dead-end error, grab whatever the
+    // camera is aimed at right now so this button works on its own, without a
+    // prior trip to the Entity Lock page.
+    int e = RaycastEntityFromCamera();
+    if (e != 0 && ENTITY::DOES_ENTITY_EXIST(e)) {
+      g_FollowTargetEntity = e;
+      g_FollowMode = 2;
+      Sequence_CaptureLockForPose(p);
+      SetStatusText(p.entityHandle != 0 ? "Locked to the aimed entity"
+                                        : "Lock failed");
+    } else {
+      p.localOffsetX = p.localOffsetY = p.localOffsetZ = 0.0f;
+      p.lockEntPitch = p.lockEntYaw = p.lockEntRoll = 0.0f;
+      SetStatusText("Aim the camera at a ped/vehicle, then press again");
+    }
   }
 }
 static void RecapturePose() {
@@ -649,16 +706,51 @@ static void BakeLockedPoses() {
   SetStatusText(b);
 }
 
-// Hover marker on the entity under the crosshair while in Aimed mode with no
-// lock yet — so the user sees what "Lock Aimed Entity" will grab.
+// Hover marker on the entity under the crosshair while no target is locked
+// yet — so the user sees what "Lock Aimed Entity" will grab. Drawn in any
+// follow mode: picking a target is the page's step 1, mode is set on lock.
 static void DrawSeqHoverMarker() {
-  if (g_FollowMode != 2 || g_FollowTargetEntity != 0) return;
+  if (g_FollowMode == 1) return;                            // player is the target
+  if (g_FollowMode == 2 && g_FollowTargetEntity != 0) return; // already locked
   int e = RaycastEntityFromCamera();
   if (e == 0 || !ENTITY::DOES_ENTITY_EXIST(e)) return;
   Vector3 p = ENTITY::GET_ENTITY_COORDS(e, TRUE);
   GRAPHICS::DRAW_MARKER(0, p.x, p.y, p.z + 1.25f, 0, 0, 0, 0, 0, 0, 0.4f, 0.4f,
                         0.4f, 255, 255, 255, 200, TRUE, TRUE, 2, FALSE, NULL,
                         NULL, FALSE);
+}
+
+// The free-cam's current lock target, resolved the same way keyframe locking
+// resolves it (mode 1 = the player ped, mode 2 = the raycast/picked entity).
+static int SeqLockTarget() {
+  int t = 0;
+  if (g_FollowMode == 1) t = PLAYER::PLAYER_PED_ID();
+  else if (g_FollowMode == 2) t = g_FollowTargetEntity;
+  if (t == 0 || !ENTITY::DOES_ENTITY_EXIST(t)) return 0;
+  return t;
+}
+
+// One-line description of the lock target for status rows:
+// "SULTAN, 42m" / "Player, 8m" / "Ped, 12m" / "" when none.
+static std::string SeqLockTargetLabel() {
+  int t = SeqLockTarget();
+  if (t == 0) return std::string();
+  float x, y, z, pi, ya, ro;
+  GetCameraState(x, y, z, pi, ya, ro);
+  Vector3 p = ENTITY::GET_ENTITY_COORDS(t, TRUE);
+  float d = sqrtf((p.x - x) * (p.x - x) + (p.y - y) * (p.y - y) +
+                  (p.z - z) * (p.z - z));
+  char b[64];
+  if (ENTITY::IS_ENTITY_A_VEHICLE(t)) {
+    const char *nm =
+        VEHICLE::GET_DISPLAY_NAME_FROM_VEHICLE_MODEL(ENTITY::GET_ENTITY_MODEL(t));
+    sprintf_s(b, "%s, %.0fm", (nm && nm[0]) ? nm : "Vehicle", d);
+  } else if (ENTITY::IS_ENTITY_A_PED(t)) {
+    sprintf_s(b, "%s, %.0fm", (g_FollowMode == 1) ? "Player" : "Ped", d);
+  } else {
+    sprintf_s(b, "Object, %.0fm", d);
+  }
+  return std::string(b);
 }
 
 // ---- Dynamic list (re)builders ----
@@ -681,10 +773,34 @@ static void RebuildPoseList() {
     g_SeqPoses.AddButton("Move All Keyframes...", [] { g_Ctrl.Push(&g_SeqMoveAll); },
                          "Shift every keyframe's position together to relocate the whole "
                          "shot to a new spot on the map without re-authoring it.");
+  if (n >= 3)
+    g_SeqPoses.AddButton("Distribute Times Evenly", [] {
+      int c = Sequence_DistributeTimes();
+      char b[48];
+      sprintf_s(b, "Re-timed %d keyframe%s evenly", c, c == 1 ? "" : "s");
+      SetStatusText(b);
+    }, "Re-space all middle keyframes evenly between the first and last one's "
+       "times - a constant-speed pass. Positions are untouched.");
+  // Everything above this line is a header row; keyframe rows start here.
+  // Recorded so the browse-preview in SeqMenu_FrameSync can map the list
+  // selection back to a keyframe index without hardcoding row counts.
+  s_poseListHeaderRows = (int)g_SeqPoses.items.size();
+  // Playhead cursor: mark the keyframe at/just before the current scrub time.
+  int curKf = -1;
+  if (s) {
+    float ph = Sequence_CurrentTime();
+    for (int i = 0; i < n; ++i)
+      if (s->poses[i].t <= ph + 0.001f) curKf = i;
+  }
   for (int i = 0; i < n; ++i) {
-    char label[24]; sprintf_s(label, "Keyframe %d", i);
+    bool locked = s->poses[i].entityHandle != 0;
+    char label[40];
+    sprintf_s(label, "%sKeyframe %d%s", (i == curKf) ? "> " : "", i,
+              locked ? "  [L]" : "");
     g_SeqPoses.AddButton(label, [i] { s_editPose = i; g_Ctrl.Push(&g_SeqPoseEdit); },
-                         "Open this keyframe to edit its pose, timing, easing and lock.")
+                         "Open this keyframe to edit its pose, timing, easing and lock. "
+                         "\"> \" marks the playhead's keyframe; [L] = entity-locked. "
+                         "Moving the selection previews each keyframe through the camera.")
         .valueGetter = [i] {
           CameraSequence *s2 = Sequence_Active();
           if (!s2 || i >= (int)s2->poses.size()) return std::string();
@@ -781,6 +897,106 @@ static void RebuildSeqList() {
   if (sel >= cnt) sel = cnt - 1; if (sel < 0) sel = 0;
   g_SeqList.selected = sel; g_SeqList.scrollOffset = scroll;
 }
+// Entity Lock page — rebuilt every frame it's shown so the status rows are
+// live. Laid out as a guided two-step flow (pick a target -> lock keyframes)
+// because the old flat button pile hid the ordering dependency and most users
+// never discovered how the feature works.
+static void RebuildSeqFollow() {
+  int sel = g_SeqFollow.selected, scroll = g_SeqFollow.scrollOffset;
+  g_SeqFollow.items.clear();
+
+  std::string tgt = SeqLockTargetLabel();
+  bool hasTarget = !tgt.empty();
+  int lockedKf = Sequence_LockedPoseCount();
+  CameraSequence *s = Sequence_Active();
+  int kfN = s ? (int)s->poses.size() : 0;
+
+  // What the feature does, in plain words (labels are skipped by navigation).
+  g_SeqFollow.AddLabel("Anchor the camera path to a moving ped or");
+  g_SeqFollow.AddLabel("vehicle: author around it parked, then it rides.");
+
+  g_SeqFollow.AddSeparator("Status");
+  g_SeqFollow.AddLabel(hasTarget ? (std::string("Target:  ") + tgt)
+                                 : std::string("Target:  none - pick one below"));
+  {
+    char b[48];
+    sprintf_s(b, "Locked keyframes:  %d / %d", lockedKf, kfN);
+    g_SeqFollow.AddLabel(b);
+  }
+
+  g_SeqFollow.AddSeparator("Step 1 - Pick a Target");
+  g_SeqFollow.AddButton("Lock Aimed Entity", [] {
+    int e = RaycastEntityFromCamera();
+    if (e) { g_FollowTargetEntity = e; g_FollowMode = 2; SetStatusText("Target locked"); }
+    else SetStatusText("Nothing under the crosshair - aim closer");
+  }, "Aim the center of the screen at a ped/vehicle/object and press. The "
+     "white marker in the world shows what will be grabbed.");
+  g_SeqFollow.AddButton("Lock Nearest Vehicle", [] {
+    float x, y, z, pi, ya, ro;
+    GetCameraState(x, y, z, pi, ya, ro);
+    int v = VEHICLE::GET_CLOSEST_VEHICLE(x, y, z, 30.0f, 0, 70);
+    if (v && ENTITY::DOES_ENTITY_EXIST(v)) { g_FollowTargetEntity = v; g_FollowMode = 2; SetStatusText("Nearest vehicle locked"); }
+    else SetStatusText("No vehicle within 30m");
+  }, "Lock the closest vehicle - works at close range where the raycast can fail.");
+  g_SeqFollow.AddButton("Lock Player's Vehicle", [] {
+    Ped p = PLAYER::PLAYER_PED_ID();
+    int v = PED::IS_PED_IN_ANY_VEHICLE(p, FALSE) ? PED::GET_VEHICLE_PED_IS_IN(p, FALSE) : 0;
+    if (v && ENTITY::DOES_ENTITY_EXIST(v)) { g_FollowTargetEntity = v; g_FollowMode = 2; SetStatusText("Player's vehicle locked"); }
+    else SetStatusText("Player isn't in a vehicle");
+  }, "Lock onto the car the player is currently sitting in.");
+  g_SeqFollow.AddButton("Use the Player", [] {
+    g_FollowMode = 1;
+    SetStatusText("Player set as target");
+  }, "Use the player ped as the target (\"track me as I walk\").");
+  if (hasTarget)
+    g_SeqFollow.AddButton("Release Target", [] {
+      g_FollowTargetEntity = 0;
+      if (g_FollowMode == 1) g_FollowMode = 0;
+      SetStatusText("Target released");
+    }, "Drop the current target. Keyframes already locked keep their lock.");
+
+  g_SeqFollow.AddSeparator("Step 2 - Lock Keyframes to It");
+  g_SeqFollow.AddLabel("New keyframes auto-lock while a target is set.");
+  g_SeqFollow.AddButton("Lock All Keyframes to Target", [] {
+    int t = SeqLockTarget();
+    if (!t) { SetStatusText("Pick a target first (Step 1)"); return; }
+    int n = Sequence_ApplyLockToAll(t);
+    char b[64]; sprintf_s(b, "Locked %d keyframes to target", n); SetStatusText(b);
+  }, "Anchor every keyframe to the target: each stores its offset from the "
+     "entity, so the whole camera move rides along when it drives off.")
+      .valueGetter = [] {
+        char b[16];
+        CameraSequence *s2 = Sequence_Active();
+        sprintf_s(b, "%d/%d", Sequence_LockedPoseCount(),
+                  s2 ? (int)s2->poses.size() : 0);
+        return std::string(b);
+      };
+  g_SeqFollow.AddButton("Clear All Keyframe Locks", [] {
+    int n = Sequence_ClearAllLocks();
+    char b[64]; sprintf_s(b, "Cleared lock from %d keyframes", n); SetStatusText(b);
+  }, "Remove entity locks from every keyframe. They keep their current world "
+     "positions and stop following the entity.");
+  g_SeqFollow.AddButton("Bake Locked Poses to World", [] { BakeLockedPoses(); },
+                        "Advanced: rewrite each locked keyframe's world position to where "
+                        "its entity is RIGHT NOW (locks stay). Use to re-base a shot after "
+                        "moving the vehicle.");
+
+  g_SeqFollow.AddSeparator("Live Camera Follow (free-fly)");
+  g_SeqFollow.AddList("Follow Mode", &g_FollowMode,
+                      {"None", "Player", "Aimed Entity"},
+                      [](int m) { if (m != 2) g_FollowTargetEntity = 0; },
+                      "What the free-fly camera tracks while authoring: nothing, the "
+                      "player, or the locked entity. Also selects the lock target above.");
+  g_SeqFollow.AddToggle("Rigid Mode", &g_FollowRigidMode, nullptr,
+                        "Free-fly follow inherits the target's rotation, not just its position.");
+  g_SeqFollow.AddToggle("Show Marker", &g_ShowLockedEntityMarker, nullptr,
+                        "Draw a marker on the locked entity.");
+
+  int cnt = (int)g_SeqFollow.items.size();
+  if (sel >= cnt) sel = cnt - 1; if (sel < 0) sel = 0;
+  g_SeqFollow.selected = sel; g_SeqFollow.scrollOffset = scroll;
+}
+
 static void BuildSeqPlayback() {
   g_SeqPlayback.items.clear();
   CameraSequence *s = Sequence_Active();
@@ -905,19 +1121,9 @@ static void RebuildSeqRender() {
                       "Fix red/blue-inverted output (orange sky). Auto detects the "
                       "game's buffer format; force RGBA or BGRA if colors come out "
                       "wrong.");
-  g_SeqRender.AddFloat("World Slow-mo", &g_RenderSlowmo, 0.0f, 1.0f, 0.01f, 2, nullptr,
-                       "Game time scale during capture. It spreads each output frame's "
-                       "samples across real time so the world moves a little between "
-                       "them (that's what makes the blur). Auto (0) picks the least "
-                       "slow-mo that still fits your FPS - the fastest lossless choice; "
-                       "setting it faster than that makes the world overshoot. It does "
-                       "NOT change render time (sample count does). Can't go below 1% "
-                       "without the game misbehaving.")
-      .valueGetter = [] {
-        if (g_RenderSlowmo <= 0.0001f) return std::string("Auto");
-        char b[8]; sprintf_s(b, "%d%%", (int)(g_RenderSlowmo * 100.0f + 0.5f));
-        return std::string(b);
-      };
+  // (The old "World Slow-mo" override slider was removed: capture time scale
+  // is always AUTO now — the self-tuning controller always picks a safe value,
+  // and every hand-set fixed scale could only match it or break sync.)
 
   // Estimated in-game FPS needed for these settings. The render plays in slow
   // motion and accumulates `samples` consecutive live frames per output frame
@@ -931,27 +1137,29 @@ static void RebuildSeqRender() {
     CameraSequence *sq = Sequence_Active();
     float speed = (sq && sq->playbackSpeed > 0.0001f) ? sq->playbackSpeed : 1.0f;
     int samples = g_RenderBlurSamples > 1 ? g_RenderBlurSamples : 1;
-    int workFrames = samples + g_RenderFlushFrames + 4; // 2 banner + ~advance
-    bool autoSlow = g_RenderSlowmo <= 0.0001f;
-    float slowmo = autoSlow ? 0.003f : g_RenderSlowmo; // AUTO bottoms out ~0.3%
-    float needFps = (float)workFrames * slowmo * g_RenderFps / speed;
+    if (samples <= 1) {
+      // No blur = instant capture: the playhead is frozen during each frame's
+      // capture work, so sync can't break — in-game FPS only affects how long
+      // the render takes.
+      g_SeqRender.AddLabel("No blur: any in-game FPS stays in sync");
+    } else {
+      int workFrames = samples + g_RenderFlushFrames + 4; // 2 banner + ~advance
+      const float slowmo = 0.003f; // AUTO's floor — time scale is always AUTO
+      float needFps = (float)workFrames * slowmo * g_RenderFps / speed;
 
-    float ft = GAMEPLAY::GET_FRAME_TIME();
-    float curFps = (ft > 0.0001f) ? (1.0f / ft) : 0.0f;
+      float ft = GAMEPLAY::GET_FRAME_TIME();
+      float curFps = (ft > 0.0001f) ? (1.0f / ft) : 0.0f;
 
-    char info[96];
-    if (autoSlow)
+      char info[96];
       sprintf_s(info, "Needs >= %.0f in-game FPS (Auto slow-mo)", needFps);
-    else
-      sprintf_s(info, "Needs approx %.0f in-game FPS @ %d%% slow-mo", needFps,
-                (int)(g_RenderSlowmo * 100.0f + 0.5f));
-    g_SeqRender.AddLabel(info);
-    if (curFps > 1.0f) {
-      char cur[64];
-      bool low = curFps < needFps * 0.95f;
-      sprintf_s(cur, "Your FPS now: %.0f%s", curFps,
-                low ? "  - TOO LOW, blur may break" : "  - OK");
-      g_SeqRender.AddLabel(cur);
+      g_SeqRender.AddLabel(info);
+      if (curFps > 1.0f) {
+        char cur[64];
+        bool low = curFps < needFps * 0.95f;
+        sprintf_s(cur, "Your FPS now: %.0f%s", curFps,
+                  low ? "  - TOO LOW, blur may break" : "  - OK");
+        g_SeqRender.AddLabel(cur);
+      }
     }
   }
 
@@ -1170,6 +1378,10 @@ static void BuildSeqTree() {
   // The sequence root rows now live in the unified root (RebuildRoot); only the
   // editors / lists / follow / render sub-pages are built here.
 
+  // ---- Keyframe list: re-arm the browse preview on entry so the row the
+  // cursor lands on previews immediately (see SeqMenu_FrameSync).
+  g_SeqPoses.onPush = [] { s_poseListPrevSel = -1; };
+
   // ---- Pose editor (mirror-bound) ----
   g_SeqPoseEdit.onPush = [] { LoadPoseMirror(); };
   g_SeqPoseEdit.onPop = [] { Sequence_SortByTime(); };
@@ -1195,10 +1407,22 @@ static void BuildSeqTree() {
   g_SeqPoseEdit.AddList("Path", &s_pm.pathI, {"Linear", "Spline"}, nullptr,
                         "Straight line to the next keyframe, or a smooth Spline curve.");
   g_SeqPoseEdit.AddButton("Entity Lock", [] { TogglePoseLock(); },
-                          "Lock this keyframe to ride along with the free-cam's target entity.")
+                          "Anchor this keyframe to a moving ped/vehicle so it rides along "
+                          "when the entity moves. Uses the target picked on the Entity Lock "
+                          "page - or, with none set, grabs whatever the camera is aimed at. "
+                          "Press again to clear.")
       .valueGetter = [] { return PoseLockLabel(); };
   g_SeqPoseEdit.AddButton("Recapture from live", [] { RecapturePose(); },
                           "Overwrite this keyframe with the camera's current pose.");
+  g_SeqPoseEdit.AddButton("Duplicate Keyframe", [] {
+    int ni = Sequence_DuplicatePose(s_editPose);
+    if (ni >= 0) {
+      s_editPose = ni;
+      LoadPoseMirror();
+      SetStatusText("Duplicated - now editing the copy");
+    }
+  }, "Copy this keyframe. The copy lands midway to the next keyframe (or +2s "
+     "past the end when this is the last one) and opens here for retiming.");
   g_SeqPoseEdit.AddButton("Delete Keyframe", [] { DeleteEditPose(); },
                           "Remove this keyframe from the sequence.");
 
@@ -1238,9 +1462,10 @@ static void BuildSeqTree() {
                           "When this effect change fires on the timeline.");
   g_SeqEventEdit.AddList("Effect", &s_em.kindI, g_EffectOpts, nullptr,
                          "Which property this event changes (shake, world speed, etc.).");
-  s_pEventValue = &g_SeqEventEdit.AddFloat("Value", &s_em.value, -100000.0f,
-                                           100000.0f, 0.05f, 3, nullptr,
-                                           "The value applied for the chosen effect.");
+  s_EventValueIdx = (int)g_SeqEventEdit.items.size();
+  g_SeqEventEdit.AddFloat("Value", &s_em.value, -100000.0f,
+                          100000.0f, 0.05f, 3, nullptr,
+                          "The value applied for the chosen effect.");
   g_SeqEventEdit.AddToggle("Ramp (lerp from prev)", &s_em.ramp, nullptr,
                            "Snap to the value instantly, or smoothly ramp from the previous event.");
   g_SeqEventEdit.AddButton("Delete Event", [] { DeleteEditEvent(); },
@@ -1273,50 +1498,9 @@ static void BuildSeqTree() {
   g_SeqVehicleEdit.AddButton("Delete This Vehicle", [] { DeleteEditVeh(); },
       "Remove this recorded vehicle from the sequence.");
 
-  // ---- Follow & Entity Lock ----
-  g_SeqFollow.AddList("Follow Mode", &g_FollowMode,
-                      {"None", "Player", "Aimed Entity"},
-                      [](int m) { if (m != 2) g_FollowTargetEntity = 0; },
-                      "What the camera tracks: nothing, the player, or a locked entity.");
-  g_SeqFollow.AddToggle("Rigid Mode", &g_FollowRigidMode, nullptr,
-                        "Inherit the target's rotation, not just its position.");
-  g_SeqFollow.AddToggle("Show Marker", &g_ShowLockedEntityMarker, nullptr,
-                        "Draw a marker on the locked entity.");
-  g_SeqFollow.AddButton("Lock Aimed Entity (raycast)", [] {
-    int e = RaycastEntityFromCamera();
-    if (e) { g_FollowTargetEntity = e; g_FollowMode = 2; SetStatusText("Locked onto entity"); }
-    else SetStatusText("No entity found. Aim closer.");
-  }, "Point the camera at a ped/vehicle/object and lock onto it.");
-  g_SeqFollow.AddButton("Lock to Nearest Vehicle", [] {
-    float x, y, z, pi, ya, ro;
-    GetCameraState(x, y, z, pi, ya, ro);
-    int v = VEHICLE::GET_CLOSEST_VEHICLE(x, y, z, 30.0f, 0, 70);
-    if (v && ENTITY::DOES_ENTITY_EXIST(v)) { g_FollowTargetEntity = v; g_FollowMode = 2; SetStatusText("Locked nearest vehicle"); }
-    else SetStatusText("No vehicle within 30m");
-  }, "Lock the closest vehicle - works at close range where the raycast can fail.");
-  g_SeqFollow.AddButton("Lock to Player's Vehicle", [] {
-    Ped p = PLAYER::PLAYER_PED_ID();
-    int v = PED::IS_PED_IN_ANY_VEHICLE(p, FALSE) ? PED::GET_VEHICLE_PED_IS_IN(p, FALSE) : 0;
-    if (v && ENTITY::DOES_ENTITY_EXIST(v)) { g_FollowTargetEntity = v; g_FollowMode = 2; SetStatusText("Locked player vehicle"); }
-    else SetStatusText("Player isn't in a vehicle");
-  }, "Lock onto the car you're currently driving.");
-  g_SeqFollow.AddButton("Unlock Entity", [] { g_FollowTargetEntity = 0; SetStatusText("Entity unlocked"); },
-                        "Release the locked entity.");
-  g_SeqFollow.AddSeparator("Keyframe Locks");
-  g_SeqFollow.AddButton("Apply Lock to All Keyframes", [] {
-    int t = 0;
-    if (g_FollowMode == 1) t = PLAYER::PLAYER_PED_ID();
-    else if (g_FollowMode == 2) t = g_FollowTargetEntity;
-    if (!t || !ENTITY::DOES_ENTITY_EXIST(t)) { SetStatusText("Lock free-cam to a target first"); return; }
-    int n = Sequence_ApplyLockToAll(t);
-    char b[64]; sprintf_s(b, "Locked %d keyframes to target", n); SetStatusText(b);
-  }, "Re-anchor every keyframe to the currently locked target entity.");
-  g_SeqFollow.AddButton("Clear All Keyframe Locks", [] {
-    int n = Sequence_ClearAllLocks();
-    char b[64]; sprintf_s(b, "Cleared lock from %d keyframes", n); SetStatusText(b);
-  }, "Remove entity locks from every keyframe (world positions are kept).");
-  g_SeqFollow.AddButton("Bake Locked Poses to World", [] { BakeLockedPoses(); },
-                        "Freeze locked keyframes at the entity's current spot (world coords).");
+  // ---- Follow & Entity Lock: rebuilt on entry + every frame it's shown
+  // (RebuildSeqFollow) so the target / locked-keyframe status rows are live.
+  g_SeqFollow.onPush = [] { RebuildSeqFollow(); };
 
   // ---- Sequences + Playback + Render are (re)built on entry ----
   g_SeqList.onPush = [] { RebuildSeqList(); };
@@ -1414,6 +1598,41 @@ static void RebuildRoot() {
     g_Root.AddFloat("Scrub Time (s)", &s_scrub, 0.0f, dur > 0.1f ? dur : 0.1f, 0.1f, 2,
                     [](float v) { Sequence_SetCurrentTime(v); },
                     "Move the playhead through the sequence by hand to preview a moment.");
+    {
+      // Keyframe stepper: scroll to jump the playhead (and camera) straight to
+      // the previous / next keyframe — the fastest way to walk through a shot.
+      CameraSequence *sq = Sequence_Active();
+      int kfN = sq ? (int)sq->poses.size() : 0;
+      if (kfN > 0) {
+        // Mirror = 1-based index of the keyframe at/just before the playhead
+        // (recomputed every rebuild, so it always tracks scrub/playback).
+        float ph = Sequence_CurrentTime();
+        int at = 0;
+        for (int i = 0; i < kfN; ++i)
+          if (sq->poses[i].t <= ph + 0.001f) at = i;
+        s_kfNav = at + 1;
+        g_Root.AddInt("Go to Keyframe", &s_kfNav, 1, kfN, 1, [](int v) {
+          CameraSequence *s2 = Sequence_Active();
+          if (!s2 || s2->poses.empty()) return;
+          int i = v - 1;
+          if (i < 0) i = 0;
+          if (i >= (int)s2->poses.size()) i = (int)s2->poses.size() - 1;
+          Sequence_SetCurrentTime(s2->poses[i].t);
+        }, "Step the playhead keyframe by keyframe. The camera snaps to each "
+           "one, so this doubles as instant teleport along the shot.")
+            .valueGetter = [] {
+              CameraSequence *s2 = Sequence_Active();
+              if (!s2 || s2->poses.empty()) return std::string();
+              int i = s_kfNav - 1;
+              if (i < 0) i = 0;
+              if (i >= (int)s2->poses.size()) i = (int)s2->poses.size() - 1;
+              char b[32];
+              sprintf_s(b, "%d/%d @ %.2fs", i + 1, (int)s2->poses.size(),
+                        s2->poses[i].t);
+              return std::string(b);
+            };
+      }
+    }
     g_Root.AddSeparator("");
     g_Root.AddSubmenu("Pose Keyframes", &g_SeqPoses,
                       "The camera poses that make up the shot. Add, edit and delete keyframes.")
@@ -1431,8 +1650,23 @@ static void RebuildRoot() {
         };
     g_Root.AddSubmenu("Playback Settings", &g_SeqPlayback,
                       "Loop, playback speed, loop-closing and in-world markers.");
-    g_Root.AddSubmenu("Follow & Entity Lock", &g_SeqFollow,
-                      "Lock the camera or keyframes to a moving ped/vehicle.");
+    g_Root.AddSubmenu("Entity Lock (Follow)", &g_SeqFollow,
+                      "Anchor the shot to a moving ped/vehicle: author the camera path "
+                      "around it parked, and the whole path rides along when it moves. "
+                      "Two steps inside: pick a target, lock the keyframes.")
+        .valueGetter = [] {
+          int locked = Sequence_LockedPoseCount();
+          bool tgt = (g_FollowMode == 1) ||
+                     (g_FollowMode == 2 && g_FollowTargetEntity != 0 &&
+                      ENTITY::DOES_ENTITY_EXIST(g_FollowTargetEntity));
+          if (locked > 0) {
+            char b[24];
+            sprintf_s(b, "%d kf locked", locked);
+            return std::string(b);
+          }
+          if (tgt) return std::string("target set");
+          return std::string("off");
+        };
     g_Root.AddSubmenu("Vehicle Clip", &g_SeqVehicle,
                       "Record a vehicle's drive and replay it in sync with the "
                       "timeline so the camera lines up frame-for-frame.")
@@ -1451,8 +1685,10 @@ static void RebuildRoot() {
         .valueGetter = [] {
           CameraSequence *s = Sequence_Active();
           char b[48];
-          sprintf_s(b, "%s [%d/%d]", s ? s->name.c_str() : "(none)",
-                    Sequence_ActiveIndex() + 1, Sequence_Count());
+          // snprintf, not sprintf_s: a long (user/JSON-supplied) sequence name
+          // would trip sprintf_s's bounds check and abort; snprintf truncates.
+          snprintf(b, sizeof(b), "%s [%d/%d]", s ? s->name.c_str() : "(none)",
+                   Sequence_ActiveIndex() + 1, Sequence_Count());
           return std::string(b);
         };
     g_Root.AddSubmenu("Render to Images", &g_SeqRender,
@@ -1491,18 +1727,64 @@ static void SeqMenu_FrameSync() {
   s_scrub = Sequence_CurrentTime();
 
   if (cur == &g_Root) { RebuildRoot(); }
-  else if (cur == &g_SeqPoses) { s_totalDur = Sequence_TotalDuration(); RebuildPoseList(); }
+  else if (cur == &g_SeqPoses) {
+    s_totalDur = Sequence_TotalDuration();
+    RebuildPoseList();
+    // Browse preview: landing the selection on a keyframe row scrubs the
+    // playhead there, so scrolling the list flips through the shot visually.
+    int kfIdx = g_SeqPoses.selected - s_poseListHeaderRows;
+    if (!Sequence_IsPlaying() && kfIdx >= 0 &&
+        g_SeqPoses.selected != s_poseListPrevSel) {
+      CameraSequence *sq = Sequence_Active();
+      if (sq && kfIdx < (int)sq->poses.size())
+        Sequence_SetCurrentTime(sq->poses[kfIdx].t);
+    }
+    s_poseListPrevSel = g_SeqPoses.selected;
+  }
   else if (cur == &g_SeqEvents) { RebuildEventList(); }
   else if (cur == &g_SeqList) { RebuildSeqList(); }
   else if (cur == &g_SeqRender) { RebuildSeqRender(); }
   else if (cur == &g_SeqVehicle) { RebuildSeqVehicle(); }
   else if (cur == &g_SeqVehicleList) { RebuildSeqVehicleList(); }
-  else if (cur == &g_SeqVehicleEdit) { WriteVehMirror(); }
-  else if (cur == &g_SeqPoseEdit) { WritePoseMirror(); }
+  else if (cur == &g_SeqVehicleEdit) {
+    WriteVehMirror();
+    // Context header: which recorded vehicle is open ("SULTAN", custom label, ...).
+    char nm[40];
+    VehicleClip_GetLabel(s_editVeh, nm, sizeof(nm));
+    if (nm[0]) g_SeqVehicleEdit.subtitle = nm;
+  }
+  else if (cur == &g_SeqPoseEdit) {
+    WritePoseMirror();
+    // Context header: which keyframe is open, out of how many.
+    CameraSequence *sq = Sequence_Active();
+    if (sq && s_editPose >= 0 && s_editPose < (int)sq->poses.size()) {
+      char b[48];
+      sprintf_s(b, "KEYFRAME %d / %d", s_editPose + 1, (int)sq->poses.size());
+      g_SeqPoseEdit.subtitle = b;
+    }
+    // Live preview: the moment any value is nudged (time, pos, rot, fov, ease),
+    // re-apply the pose at the keyframe's time so the edit is visible through
+    // the camera instantly. Value-change–gated, so free-flying to compare or
+    // recapture stays untouched. (Also fires once on open — the stale s_pmPrev
+    // differs — which doubles as preview-on-open.)
+    if (memcmp(&s_pm, &s_pmPrev, sizeof(s_pm)) != 0) {
+      if (!Sequence_IsPlaying()) Sequence_SetCurrentTime(s_pm.t);
+      memcpy(&s_pmPrev, &s_pm, sizeof(s_pm));
+    }
+  }
   else if (cur == &g_SeqEventEdit) {
     WriteEventMirror();
-    if (s_pEventValue) s_pEventValue->fStep = SeqEventValueStep(s_em.kindI);
+    // Context header, same as the pose editor.
+    CameraSequence *sq = Sequence_Active();
+    if (sq && s_editEvent >= 0 && s_editEvent < (int)sq->events.size()) {
+      char b[32];
+      sprintf_s(b, "EVENT %d / %d", s_editEvent + 1, (int)sq->events.size());
+      g_SeqEventEdit.subtitle = b;
+    }
+    if (s_EventValueIdx >= 0 && s_EventValueIdx < (int)g_SeqEventEdit.items.size())
+      g_SeqEventEdit.items[s_EventValueIdx].fStep = SeqEventValueStep(s_em.kindI);
   } else if (cur == &g_SeqFollow) {
+    RebuildSeqFollow();
     DrawSeqHoverMarker();
   }
 }

@@ -78,6 +78,17 @@ bool UsesNativeSpin();
 // wheel roll each frame, so a teleported/parked ghost still appears to drive.
 void SetWheelRotationSpeed(int vehicle, float radPerSec);
 
+// True once the suspension-compression offset has resolved (memory backend
+// only). Replay writes the recorded compression back each frame so a
+// collision-off ghost keeps its recorded ride height instead of drooping the
+// wheels into the road.
+bool SuspAvailable();
+
+// Read / write each wheel's suspension compression. Mirrors the wheel-angle
+// calls. Returns the number read (Read) / no-op if unavailable.
+int ReadWheelSusp(int vehicle, float *out, int maxCount);
+void WriteWheelSusp(int vehicle, const float *comp, int count);
+
 // True once the per-wheel STEERING-angle offset has resolved. Steering can be
 // driven by direct memory write (unlike SET_VEHICLE_STEER_BIAS, this works even
 // with a driver ped seated).

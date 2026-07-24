@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #pragma warning(disable : 4244 4305)
@@ -64,6 +65,7 @@ struct ClipSample {
   int   nWheels;           // wheels captured (0 if memory access unavailable)
   float wheel[VehMem::kMaxWheels]; // per-wheel rotation angle (radians)
   float steer[VehMem::kMaxWheels]; // per-wheel steering angle (radians, signed)
+  float susp[VehMem::kMaxWheels];  // per-wheel suspension compression
 };
 
 // One recorded vehicle: its samples, appearance, and (during replay) a spawned
@@ -78,6 +80,9 @@ struct VehClip {
   bool ghostPending;  // wants a ghost spawned for replay
   bool collisionOff;  // we currently hold the ghost (collision disabled)
   bool hasSteer;      // per-wheel steering angles were recorded (memory-driven)
+  bool hasSusp;       // per-wheel suspension compression was recorded — replay
+                      // writes it back so the collision-off ghost keeps its
+                      // recorded ride height (no wheels drooping into the road)
   float steerSmoothed; // low-passed fallback visual steer (no recorded steer)
 };
 
@@ -111,6 +116,7 @@ static std::vector<ClipSample> s_recSamples;
 static VehVisual s_recVisual = {};
 static PedVisual s_recPed = {};  // driver ped captured at record start
 static bool s_recHasSteer = false; // steering offset was available at record
+static bool s_recHasSusp = false;  // suspension offset was available at record
 
 // Hard cap so a forgotten recording can't grow without bound (120 s).
 static const float kMaxRecordSeconds = 120.0f;
@@ -170,6 +176,10 @@ static ClipSample SampleVehicle(int veh, float t) {
   // seated driver, which SET_VEHICLE_STEER_BIAS does not.
   if (VehMem::SteerAvailable())
     VehMem::ReadWheelSteer(veh, s.steer, VehMem::kMaxWheels);
+  // Per-wheel suspension compression — replayed so the collision-off ghost
+  // keeps the recorded ride height instead of drooping wheels into the road.
+  if (VehMem::SuspAvailable())
+    VehMem::ReadWheelSusp(veh, s.susp, VehMem::kMaxWheels);
   return s;
 }
 
@@ -443,9 +453,11 @@ static void ApplyClipAtTime(VehClip &c, float t, bool animateWheels) {
   int nWheels = a.nWheels;
   float wheelAng[VehMem::kMaxWheels];
   float steerArr[VehMem::kMaxWheels];
+  float suspArr[VehMem::kMaxWheels];
   for (int w = 0; w < nWheels; ++w) {
     wheelAng[w] = a.wheel[w];
     steerArr[w] = a.steer[w];
+    suspArr[w] = a.susp[w];
   }
 
   if (i + 1 < (int)S.size()) {
@@ -468,6 +480,7 @@ static void ApplyClipAtTime(VehClip &c, float t, bool animateWheels) {
       while (d <= -kPi) d += 2.0f * kPi;
       wheelAng[w] = a.wheel[w] + u * d;
       steerArr[w] = a.steer[w] + u * (b.steer[w] - a.steer[w]); // plain lerp
+      suspArr[w] = a.susp[w] + u * (b.susp[w] - a.susp[w]);     // plain lerp
     }
     nWheels = nw;
   }
@@ -500,6 +513,14 @@ static void ApplyClipAtTime(VehClip &c, float t, bool animateWheels) {
     // Memory backend (singleplayer): write the recorded roll angle to each CWheel.
     VehMem::WriteWheelAngles(veh, wheelAng, nWheels);
   }
+
+  // Suspension compression: the ghost runs with collision off, so physics never
+  // resolves wheel-ground contact and the wheels droop to full extension —
+  // sinking visibly into the road. Writing the recorded compression back each
+  // frame restores the exact recorded stance. (Old clips without recorded
+  // suspension keep the previous behavior.)
+  if (c.hasSusp && nWheels > 0 && VehMem::SuspAvailable())
+    VehMem::WriteWheelSusp(veh, suspArr, nWheels);
 
   // Steering. Preferred path = write the recorded per-wheel steer angle to
   // memory (works even with a seated driver, which SET_VEHICLE_STEER_BIAS does
@@ -541,6 +562,7 @@ bool VehicleClip_StartRecording() {
 
   VehMem::Init();
   s_recHasSteer = VehMem::SteerAvailable(); // record per-wheel steer if we can
+  s_recHasSusp = VehMem::SuspAvailable();   // record per-wheel suspension too
   s_recSamples.clear();
   CaptureVisual(veh, s_recVisual);
   CapturePedVisual(ped, s_recPed); // remember the driver (model + outfit)
@@ -572,16 +594,26 @@ void VehicleClip_StopRecording() {
     c.ghostPending = true; // replay as a ghost from here on
     c.collisionOff = false;
     c.hasSteer = s_recHasSteer;
+    c.hasSusp = s_recHasSusp;
     s_clips.push_back(c);
   }
 
-  // Put the player's car (and the player in it) back at the START of the path
-  // they just drove — so it's out of the middle of the scene and lined up with
-  // where the ghost replays from, ready to layer another take or watch it back.
+  // Put the player's car (and the player in it) back NEXT TO the start of the
+  // path they just drove — out of the middle of the scene and lined up for
+  // another take. One lane to the RIGHT of the recorded starting pose, not ON
+  // it: the ghost replays from exactly the first sample, so parking there
+  // would drop the player's car inside the ghost.
   if (!s_recSamples.empty() && VehicleValid(s_recVehicle)) {
     const ClipSample &s0 = s_recSamples.front();
-    ENTITY::SET_ENTITY_COORDS_NO_OFFSET(s_recVehicle, s0.px, s0.py, s0.pz, FALSE,
-                                        FALSE, FALSE);
+    // Right vector of the recorded start orientation (first column of the
+    // quaternion's rotation matrix; GTA: X = right, Y = forward, Z = up).
+    float rx = 1.0f - 2.0f * (s0.qy * s0.qy + s0.qz * s0.qz);
+    float ry = 2.0f * (s0.qx * s0.qy + s0.qw * s0.qz);
+    float rz = 2.0f * (s0.qx * s0.qz - s0.qw * s0.qy);
+    const float kSideOffset = 4.0f; // ~one lane over
+    ENTITY::SET_ENTITY_COORDS_NO_OFFSET(
+        s_recVehicle, s0.px + rx * kSideOffset, s0.py + ry * kSideOffset,
+        s0.pz + rz * kSideOffset, FALSE, FALSE, FALSE);
     ENTITY::SET_ENTITY_QUATERNION(s_recVehicle, s0.qx, s0.qy, s0.qz, s0.qw);
     ENTITY::SET_ENTITY_VELOCITY(s_recVehicle, 0.0f, 0.0f, 0.0f);
   }
@@ -870,6 +902,24 @@ static void ApplyPedVisual(int ped, const PedVisual &v) {
 //  Persistence — JSON clip sidecar (array of clips)
 // ============================================================
 
+// Make a user-supplied string safe to embed in a JSON double-quoted value.
+// The reader is a simple scan-until-quote loop that does NOT decode escape
+// sequences, so rather than emit \" / \\ (which it would mis-parse) we replace
+// the structural characters with harmless look-alikes and drop control chars.
+// This keeps the document valid even for a label like: He said "go"\stop.
+static std::string JsonSanitize(const char *s) {
+  std::string out;
+  if (!s) return out;
+  for (; *s; ++s) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"') out += '\'';
+    else if (c == '\\') out += '/';
+    else if (c >= 0x20) out += (char)c;
+    // control chars (< 0x20) are dropped
+  }
+  return out;
+}
+
 static void WriteVisual(FILE *f, const VehVisual &v) {
   fprintf(f, "    \"model\": %d,\n", v.model);
   fprintf(f, "    \"visual\": {\n");
@@ -882,7 +932,8 @@ static void WriteVisual(FILE *f, const VehVisual &v) {
           v.csG, v.csB);
   fprintf(f, "      \"windowTint\": %d, \"wheelType\": %d, \"livery\": %d,\n",
           v.windowTint, v.wheelType, v.livery);
-  fprintf(f, "      \"plateIdx\": %d, \"plate\": \"%s\",\n", v.plateIdx, v.plate);
+  fprintf(f, "      \"plateIdx\": %d, \"plate\": \"%s\",\n", v.plateIdx,
+          JsonSanitize(v.plate).c_str());
   fprintf(f, "      \"toggleMask\": %u,\n", v.toggleMask);
   fprintf(f, "      \"mods\": [");
   for (int m = 0; m < kModSlots; ++m) fprintf(f, "%s%d", m ? "," : "", v.mods[m]);
@@ -919,6 +970,9 @@ static void WriteSamples(FILE *f, const std::vector<ClipSample> &S) {
     fprintf(f, "],\"s\":[");
     for (int w = 0; w < s.nWheels; ++w)
       fprintf(f, "%s%.4f", w ? "," : "", s.steer[w]);
+    fprintf(f, "],\"sc\":[");
+    for (int w = 0; w < s.nWheels; ++w)
+      fprintf(f, "%s%.4f", w ? "," : "", s.susp[w]);
     fprintf(f, "]}%s\n", (i + 1 < S.size()) ? "," : "");
   }
   fprintf(f, "    ]\n");
@@ -937,12 +991,14 @@ void VehicleClip_WriteClipsJson(FILE *f) {
     if (c.samples.size() < 2) continue;
     fprintf(f, "  {\n");
     fprintf(f, "    \"hasSteer\": %d,\n", c.hasSteer ? 1 : 0);
+    fprintf(f, "    \"hasSusp\": %d,\n", c.hasSusp ? 1 : 0);
     fprintf(f, "    \"settings\": {\"enabled\":%d,\"speed\":%.4f,\"offset\":%.4f,"
                "\"lights\":%d,\"engine\":%d,\"siren\":%d,\"driver\":%d,"
                "\"collision\":%d,\"godmode\":%d,\"label\":\"%s\"},\n",
             c.st.enabled ? 1 : 0, c.st.speed, c.st.offset, c.st.lights,
             c.st.engineOn ? 1 : 0, c.st.siren ? 1 : 0, c.st.showDriver ? 1 : 0,
-            c.st.collision ? 1 : 0, c.st.godmode ? 1 : 0, c.st.label);
+            c.st.collision ? 1 : 0, c.st.godmode ? 1 : 0,
+            JsonSanitize(c.st.label).c_str());
     WriteVisual(f, c.visual);
     WritePed(f, c.ped);
     WriteSamples(f, c.samples);
@@ -1099,6 +1155,7 @@ static void ParseClipObject(const char *start, const char *end) {
   pv.valid = (pv.model != 0);
 
   if ((k = AfterKey(start, headerEnd, "hasSteer"))) c.hasSteer = atoi(k) != 0;
+  if ((k = AfterKey(start, headerEnd, "hasSusp"))) c.hasSusp = atoi(k) != 0;
 
   // Per-clip settings (optional — older clips default from the globals).
   c.st = DefaultClipSettings();
@@ -1150,7 +1207,14 @@ static void ParseClipObject(const char *start, const char *end) {
           ParseFloatArray(kk, tmp, 3, &cnt);
           if (cnt >= 3) { s.vx = tmp[0]; s.vy = tmp[1]; s.vz = tmp[2]; }
         }
-        if ((kk = AfterKey(p, objEnd, "nw"))) s.nWheels = atoi(kk);
+        if ((kk = AfterKey(p, objEnd, "nw"))) {
+          s.nWheels = atoi(kk);
+          // Clamp unconditionally: a malformed sample can carry "nw" without a
+          // matching "w" array, and nWheels later drives fixed-size stack arrays
+          // (wheel[]/steer[] are only kMaxWheels) in ApplyClipAtTime.
+          if (s.nWheels < 0) s.nWheels = 0;
+          if (s.nWheels > VehMem::kMaxWheels) s.nWheels = VehMem::kMaxWheels;
+        }
         if ((kk = AfterKey(p, objEnd, "w"))) {
           ParseFloatArray(kk, s.wheel, VehMem::kMaxWheels, &cnt);
           if (s.nWheels > cnt) s.nWheels = cnt;
@@ -1162,6 +1226,13 @@ static void ParseClipObject(const char *start, const char *end) {
           ParseFloatArray(kk, st, VehMem::kMaxWheels, &sc);
           for (int w = 0; w < VehMem::kMaxWheels; ++w)
             s.steer[w] = (w < sc) ? st[w] : 0.0f;
+        }
+        if ((kk = AfterKey(p, objEnd, "sc"))) {
+          float sp[VehMem::kMaxWheels];
+          int spc;
+          ParseFloatArray(kk, sp, VehMem::kMaxWheels, &spc);
+          for (int w = 0; w < VehMem::kMaxWheels; ++w)
+            s.susp[w] = (w < spc) ? sp[w] : 0.0f;
         }
         c.samples.push_back(s);
         p = objEnd + 1;
@@ -1250,6 +1321,9 @@ bool VehicleClip_GetSettings(int index, VehicleClipSettings *out) {
 void VehicleClip_SetSettings(int index, const VehicleClipSettings *in) {
   if (!in || index < 0 || index >= (int)s_clips.size()) return;
   s_clips[index].st = *in;
+  // Guard speed like the load path does — a 0 (or negative) multiplier freezes
+  // the ghost at its first sample forever (localT = (t-offset)*speed == 0).
+  if (s_clips[index].st.speed < 0.05f) s_clips[index].st.speed = 1.0f;
 }
 
 void VehicleClip_GetLabel(int index, char *out, int outLen) {
@@ -1257,7 +1331,19 @@ void VehicleClip_GetLabel(int index, char *out, int outLen) {
   out[0] = '\0';
   if (index < 0 || index >= (int)s_clips.size()) return;
   const VehClip &c = s_clips[index];
-  if (c.st.label[0]) strncpy_s(out, outLen, c.st.label, _TRUNCATE);
+  if (c.st.label[0]) {
+    strncpy_s(out, outLen, c.st.label, _TRUNCATE);
+    return;
+  }
+  // No custom label: default to the recorded vehicle's model name ("SULTAN"),
+  // numbered so several clips of the same car stay distinguishable.
+  const char *nm = nullptr;
+  if (c.visual.model != 0) {
+    nm = VEHICLE::GET_DISPLAY_NAME_FROM_VEHICLE_MODEL((Hash)c.visual.model);
+    // The native answers "CARNOTFOUND" for hashes it can't resolve.
+    if (nm && (!nm[0] || strcmp(nm, "CARNOTFOUND") == 0)) nm = nullptr;
+  }
+  if (nm) sprintf_s(out, outLen, "%d. %s", index + 1, nm);
   else sprintf_s(out, outLen, "Vehicle %d", index + 1);
 }
 
@@ -1296,6 +1382,12 @@ int VehicleClip_VehicleHandle() {
   for (const VehClip &c : s_clips)
     if (c.ghost != 0 && VehicleValid(c.ghost)) return c.ghost;
   return VehicleValid(s_recVehicle) ? s_recVehicle : 0;
+}
+
+int VehicleClip_GhostAt(int index) {
+  if (index < 0 || index >= (int)s_clips.size()) return 0;
+  const VehClip &c = s_clips[index];
+  return (c.ghost != 0 && VehicleValid(c.ghost)) ? c.ghost : 0;
 }
 
 bool VehicleClip_OwnsEntity(int handle) {

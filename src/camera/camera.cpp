@@ -190,6 +190,13 @@ static bool s_FocusSet = false;     // SET_FOCUS_ENTITY active (in-vehicle case)
 static bool s_StreamActive = false; // currently anchoring streaming to the cam
 static Entity s_RotationAnchor = 0;
 
+// Rigid-follow attach state. File-scoped (not function-local statics) so
+// DestroyFreeCamera can reset them on teardown — otherwise a stale "already
+// attached" flag survives into the next free-cam session and the freshly
+// created s_Cam is never attached to the follow target.
+static bool s_IsAttached = false;
+static int s_AttachedEntity = 0;
+
 // Drone physics state
 static float s_DroneVelX = 0.0f;
 static float s_DroneVelY = 0.0f;
@@ -662,6 +669,23 @@ void DestroyFreeCamera() {
   g_HideHUD = false;
   g_HidePlayer = false;
 
+  // Detach from any follow target and clear the attach flags so a later
+  // free-cam session re-attaches its fresh camera instead of assuming it's
+  // already bound (the flags are file-scoped and persist otherwise).
+  if (s_IsAttached && s_Cam != 0)
+    invoke<Void>(0xA2FABBE87F4BAD82, s_Cam, FALSE); // DETACH_CAM
+  s_IsAttached = false;
+  s_AttachedEntity = 0;
+
+  // Delete the quaternion-mode rotation anchor prop. Without this it leaks an
+  // (invisible, frozen) object into the world every session, and its stale
+  // non-zero handle would suppress re-creation/re-attach next time.
+  if (s_RotationAnchor != 0) {
+    if (ENTITY::DOES_ENTITY_EXIST(s_RotationAnchor))
+      ENTITY::DELETE_ENTITY(&s_RotationAnchor);
+    s_RotationAnchor = 0;
+  }
+
   // Destroy script camera and restore gameplay camera
   CAM::RENDER_SCRIPT_CAMS(FALSE, FALSE, 0, TRUE, FALSE);
   CAM::SET_CAM_ACTIVE(s_Cam, FALSE);
@@ -824,8 +848,8 @@ void UpdateFreeCamera() {
   // --- Follow Entity Delta Tracking ---
   static Vector3 s_LastTargetPos = {0, 0, 0};
   static Vector3 s_LastTargetRot = {0, 0, 0};
-  static bool s_IsAttached = false;
-  static int s_AttachedEntity = 0;
+  // s_IsAttached / s_AttachedEntity are now file-scoped (see top of file) so
+  // teardown can clear them; s_LocalOffset stays local (recomputed on attach).
   static Vector3 s_LocalOffset = {0, 0, 0};
 
   int targetHandle = 0;
@@ -1638,9 +1662,17 @@ void UpdateFreeCamera() {
       float endZ = s_PosZ + dirZ * 1000.0f;
 
       // START_EXPENSIVE_SYNCHRONOUS_SHAPE_TEST_LOS_PROBE (flags: -1 = intersect
-      // everything, p8 = 7)
+      // everything, p8 = 7). Ignore the frozen ped only while it's ON FOOT
+      // (it can be parked at the camera by Stream Around Camera and would
+      // self-hit) — the ignore extends to attached entities, so ignoring a
+      // ped seated in a car would make autofocus look straight through the
+      // player's own vehicle and focus the background instead.
+      int afIgnore = (ENTITY::DOES_ENTITY_EXIST(s_FrozenPed) &&
+                      PED::IS_PED_IN_ANY_VEHICLE(s_FrozenPed, FALSE))
+                         ? 0
+                         : s_FrozenPed;
       int handle = invoke<int>(0x377906D8A31E5586, s_PosX, s_PosY, s_PosZ, endX,
-                               endY, endZ, -1, s_FrozenPed, 7);
+                               endY, endZ, -1, afIgnore, 7);
 
       int hit = 0;
       Vector3 endCoords, surfaceNormal;
@@ -1868,8 +1900,12 @@ void UpdateTimeWeather() {
 
   // Weather Blending logic
   if (g_BlendWeatherActive && g_WeatherBlend > 0.0f) {
-    Hash w1 = GAMEPLAY::GET_HASH_KEY((char *)g_WeatherNames[g_Weather1Index]);
-    Hash w2 = GAMEPLAY::GET_HASH_KEY((char *)g_WeatherNames[g_Weather2Index]);
+    // Clamp before indexing g_WeatherNames[] — a stray index here reads a bad
+    // char* and passes garbage to GET_HASH_KEY.
+    int i1 = (g_Weather1Index < 0 || g_Weather1Index >= g_WeatherCount) ? 0 : g_Weather1Index;
+    int i2 = (g_Weather2Index < 0 || g_Weather2Index >= g_WeatherCount) ? 0 : g_Weather2Index;
+    Hash w1 = GAMEPLAY::GET_HASH_KEY((char *)g_WeatherNames[i1]);
+    Hash w2 = GAMEPLAY::GET_HASH_KEY((char *)g_WeatherNames[i2]);
     SetWeatherTransition(w1, w2, g_WeatherBlend);
   }
 }

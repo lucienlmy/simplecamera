@@ -114,6 +114,7 @@ void LoadSettings() {
   // ---- Auto Drive ---- (mode/speed/style persist; the enabled flag is
   // transient вЂ” it's never auto-engaged on load)
   g_AutoDriveMode = GetPrivateProfileIntA("AutoDrive", "Mode", g_AutoDriveMode, path);
+  if (g_AutoDriveMode < 0 || g_AutoDriveMode > 1) g_AutoDriveMode = 0;
   g_AutoDriveSpeed = IniReadFloat("AutoDrive", "Speed", g_AutoDriveSpeed, path);
   g_AutoDriveStyleIndex = GetPrivateProfileIntA("AutoDrive", "StyleIndex", g_AutoDriveStyleIndex, path);
   if (g_AutoDriveStyleIndex < 0 || g_AutoDriveStyleIndex >= g_AutoDriveStyleCount)
@@ -131,6 +132,7 @@ void LoadSettings() {
   // ---- Shake ----
   g_ShakeEnabled = IniReadBool("Shake", "Enabled", g_ShakeEnabled, path);
   g_ShakePreset = GetPrivateProfileIntA("Shake", "Preset", g_ShakePreset, path);
+  if (g_ShakePreset < 0 || g_ShakePreset > 5) g_ShakePreset = 0;
   g_ShakeAmp = IniReadFloat("Shake", "Amplitude", g_ShakeAmp, path);
   g_ShakeFreq = IniReadFloat("Shake", "Frequency", g_ShakeFreq, path);
   g_ShakeSpeedAmpCoupling = IniReadFloat("Shake", "SpeedAmpCoupling", g_ShakeSpeedAmpCoupling, path);
@@ -186,6 +188,7 @@ void LoadSettings() {
   g_SeqPathG = GetPrivateProfileIntA("Sequence", "PathG", g_SeqPathG, path);
   g_SeqPathB = GetPrivateProfileIntA("Sequence", "PathB", g_SeqPathB, path);
   g_SeqTimeLabelMode = GetPrivateProfileIntA("Sequence", "TimeLabelMode", g_SeqTimeLabelMode, path);
+  if (g_SeqTimeLabelMode < 0 || g_SeqTimeLabelMode > 4) g_SeqTimeLabelMode = 2;
   g_VehicleClipSampleHz =
       GetPrivateProfileIntA("Sequence", "ClipSampleHz", g_VehicleClipSampleHz, path);
   g_VehicleClipSteerGain =
@@ -496,10 +499,8 @@ int g_RenderFlushFrames = 3;   // clean frames after the banner, before grabbing
 int g_RenderBlurSamples = 1;   // motion-blur sub-samples per frame (1 = off)
 int g_RenderFormat = 0;        // 0 = PNG (lossless), 1 = JPEG (lightweight)
 int g_RenderJpegQuality = 90;  // JPEG quality 1..100
-float g_RenderSlowmo = 0.0f;   // capture time scale. 0 = AUTO: pick a safe
-                                      // value so each frame's capture work fits
-                                      // the 1/fps budget (synced stays in sync).
-                                      // >0 = fixed time scale.
+// (The former g_RenderSlowmo fixed-time-scale override is gone: the capture
+// time scale is always AUTO-managed inside ProcessRenderToImages.)
 float g_RenderHighlightBoost = 0.3f; // 0..0.99 вЂ” highlight lift in blur accumulation
 int g_RenderChannelOrder = 0;  // captured channel order: 0 = Auto (addon
                                       // detects the back-buffer format), 1 = RGBA,
@@ -614,47 +615,96 @@ void ProcessRenderToImages() {
     int syncSamples = g_RenderBlurSamples;
     if (syncSamples < 1) syncSamples = 1;
 
+    // No-blur capture is a time INSTANT: the playhead must sit ON its 1/fps
+    // grid mark when the addon grabs the frame. Any sequence time consumed
+    // between crossing the mark and the actual capture present (banner, flush,
+    // addon ack latency, PNG encode) shifts that frame's true time by a
+    // VARIABLE amount — and frame-to-frame variance in that shift is visible
+    // as speed ramps / judder in the output. So without blur we freeze the
+    // playhead (near-zero time scale) for the whole work block and advance
+    // ONLY in the catch-up loop, creeping the final approach so each capture
+    // lands within a couple percent of its grid mark. With blur the work
+    // block MUST stay live (the samples need world motion between them), so
+    // that path keeps the AUTO budget controller as before.
+    const bool instantCapture = (syncSamples == 1);
+    const float kFrozenScale = 0.001f; // ~frozen (0.0 risks engine clamping)
+
     // Per-output-frame game-time budget = the sequence-time step between output
     // frames (speed-scaled). If the capture work for one output frame consumes
     // MORE than this, playback overshoots the next grid mark and the world runs
     // fast. AUTO tunes the time scale to keep the work inside the budget.
     const float budget = stepT;
-    const bool autoSlow = g_RenderSlowmo <= 0.0001f;
-    // curSlowmo is the live time scale stepDyn asserts; AUTO adapts it per frame.
+    // curSlowmo is the live time scale stepDyn asserts; AUTO adapts it per
+    // frame. Time scale is ALWAYS auto-managed — the fixed "World Slow-mo"
+    // override was removed from the UI: any hand-set value could only match
+    // what AUTO picks or break sync, so it was pure foot-gun.
     float curSlowmo;
-    if (autoSlow) {
-      // Initial estimate from fps x work (assumes ~30 real fps; it self-corrects
-      // within a few frames from measured consumption anyway).
+    if (instantCapture) {
+      // Playhead is frozen during the work block, so the time scale's only
+      // job is catch-up granularity: aim for ~12 advance frames per output
+      // frame (at ~60 real fps), with a 4x finer creep on final approach.
+      // The budget controller below is skipped — consumed is ~0 by design.
+      curSlowmo = stepT * 5.0f;
+      if (curSlowmo < 0.005f) curSlowmo = 0.005f;
+      if (curSlowmo > 0.5f) curSlowmo = 0.5f;
+    } else {
+      // Initial estimate from fps x work (assumes ~30 real fps; it
+      // self-corrects within a few frames from measured consumption anyway).
       int workFrames = 2 + g_RenderFlushFrames + syncSamples;
       curSlowmo = budget / ((float)workFrames * 0.033f) * 0.7f;
       if (curSlowmo < 0.005f) curSlowmo = 0.005f;
       if (curSlowmo > 0.2f) curSlowmo = 0.2f;
-    } else {
-      curSlowmo = g_RenderSlowmo;
     }
 
     float savedSpeed = s->playbackSpeed;
+    bool savedLoop = s->loop;
     s->playbackSpeed = 1.0f; // 1:1 so output frame i maps to sequence time i/fps
+    s->loop = false; // a render is ONE pass — a loop wrap would yank the
+                     // playhead backward and force the catch-up loop to replay
+                     // nearly the whole sequence to re-reach its target
     Sequence_SetCurrentTime(rangeStart); // start at the range's beginning
     Sequence_Play(); // Play snapshots/restores shake config itself
 
-    auto stepDyn = [&](bool banner) {
+    // Assert the capture time scale BEFORE the first tick — SET_TIME_SCALE
+    // affects the NEXT frame's dt, so without this the first FrameTick would
+    // consume one full-speed frame and push frame 0 off its grid mark.
+    GAMEPLAY::SET_TIME_SCALE(instantCapture ? kFrozenScale : curSlowmo);
+
+    // `scale` is the time scale asserted for the frame this call waits out —
+    // curSlowmo while advancing toward the next grid mark, kFrozenScale during
+    // the no-blur work block so the playhead stays pinned on the mark.
+    auto stepDyn = [&](bool banner, float scale) {
       DisableMenuPhoneControls();
       if (Sequence_IsInMode()) Sequence_FrameTick(); // camera+world+events+shake on one clock
       UpdateTimeWeather();
       UpdateGlobalEffects();
-      GAMEPLAY::SET_TIME_SCALE(curSlowmo); // reassert capture slow-mo
+      GAMEPLAY::SET_TIME_SCALE(scale); // reassert capture time scale
       if (banner) DrawRenderProgress(progDone, total, folder);
       WAIT(0);
     };
+    // Time scale for the banner/flush/capture block of each output frame.
+    // (A function, not a snapshot — AUTO retunes curSlowmo between frames.)
+    auto workScale = [&] { return instantCapture ? kFrozenScale : curSlowmo; };
 
     int cap = 0;
     while (cap < total && !cancelled && !addonFail) {
       progDone = cap;
       float target = rangeStart + (float)cap * stepT; // sequence time for this frame
       int safety = 0;
+      float lastAdv = 0.0f; // sequence time the previous advance frame covered
       while (Sequence_CurrentTime() < target && !cancelled) {
-        stepDyn(true);
+        // Final-approach creep (no-blur only): once the remaining distance is
+        // within a few frame-steps, advance 4x finer so we exit this loop —
+        // and therefore capture — within ~2% of the grid mark instead of
+        // overshooting by up to a full step. (SET_TIME_SCALE affects the NEXT
+        // frame's dt, hence the 3x lookahead margin.)
+        float remain = target - Sequence_CurrentTime();
+        float scale = curSlowmo;
+        if (instantCapture && lastAdv > 0.0f && remain < lastAdv * 3.0f)
+          scale = curSlowmo * 0.25f;
+        float t0 = Sequence_CurrentTime();
+        stepDyn(true, scale);
+        lastAdv = Sequence_CurrentTime() - t0;
         bool bBack;
         GetMenuButtons(NULL, &bBack, NULL, NULL, NULL, NULL);
         if (bBack) cancelled = true;
@@ -677,14 +727,14 @@ void ProcessRenderToImages() {
       // the advance loop above is skipped when the per-frame blur work has
       // already overshot the grid mark.
       for (int k = 0; k < 2 && !cancelled; ++k) {
-        stepDyn(true);
+        stepDyn(true, workScale());
         bool bBack;
         GetMenuButtons(NULL, &bBack, NULL, NULL, NULL, NULL);
         if (bBack) cancelled = true;
       }
       if (cancelled) break;
       // Clean frames so the banner clears the pipeline before grabbing.
-      for (int k = 0; k < g_RenderFlushFrames; ++k) stepDyn(false);
+      for (int k = 0; k < g_RenderFlushFrames; ++k) stepDyn(false, workScale());
 
       char path[MAX_PATH];
       sprintf_s(path, "%s\\frame_%06d.%s", folder, cap, ext);
@@ -699,7 +749,7 @@ void ProcessRenderToImages() {
       for (int j = 0; j < syncSamples && !addonFail && !cancelled; ++j) {
         FxCapture_RequestSample(path, syncSamples, j);
         int guard = 0;
-        while (!FxCapture_IsLastDone() && guard < 300) { stepDyn(false); ++guard; }
+        while (!FxCapture_IsLastDone() && guard < 300) { stepDyn(false, workScale()); ++guard; }
         if (guard >= 300) addonFail = true;
         bool bBack;
         GetMenuButtons(NULL, &bBack, NULL, NULL, NULL, NULL);
@@ -713,7 +763,10 @@ void ProcessRenderToImages() {
       // than one output step, so the catch-up loop above re-engages every frame
       // and the playhead can't run away. Too much consumed -> slow down; plenty
       // of headroom -> speed up (don't waste wall-clock). Self-correcting.
-      if (autoSlow) {
+      // Skipped in instant-capture mode: the work block runs frozen there, so
+      // consumed is ~0 by design and the controller would just ramp curSlowmo
+      // to its cap, wrecking the catch-up granularity chosen above.
+      if (!instantCapture) {
         float consumed = Sequence_CurrentTime() - tWorkStart;
         if (consumed > budget * 0.85f) curSlowmo *= 0.7f;
         else if (consumed < budget * 0.40f) curSlowmo *= 1.15f;
@@ -725,6 +778,7 @@ void ProcessRenderToImages() {
 
     Sequence_Stop();
     s->playbackSpeed = savedSpeed;
+    s->loop = savedLoop;
   }
 
   // Restore.

@@ -33,3 +33,6 @@ README.txt
 gta5mods.txt
 
 *.json
+
+# Local tooling - never commit the commit/push helper itself
+commit-push.bat

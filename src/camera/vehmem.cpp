@@ -51,6 +51,7 @@ int g_wheelCntOff = 0;   // CVehicle: wheel count
 int g_wheelAngOff = 0;   // CWheel: visible rotation angle (radians)
 int g_wheelVelOff = 0;   // CWheel: rotation angular velocity
 int g_wheelSteerOff = 0; // CWheel: steering angle (radians, signed)
+int g_wheelSuspOff = 0;  // CWheel: suspension compression (ride height)
 
 // ---- Game module range (the .text section we scan) ----
 const uint8_t *g_scanBase = nullptr;
@@ -181,12 +182,14 @@ bool Init() {
           FindPattern("C7 83 ? ? 00 00 00 00 00 00 48 89 D9 48 8D 54 24 30")) {
     // Enhanced: SuspComp = the C7 83 store's disp32 (+2); angle/angvel at +0xC/+0x10.
     int suspComp = Disp32At(m, 2);
+    g_wheelSuspOff = suspComp;
     g_wheelAngOff = suspComp + 0xC;
     g_wheelVelOff = suspComp + 0x10;
   } else if (const uint8_t *m =
                  FindPattern("45 0F 57 ? F3 0F 11 ? ? ? 00 00 F3 0F 5C")) {
     // Legacy: SuspComp = the F3 0F 11 store's disp32 (+8); angle/angvel at +8/+0xC.
     int suspComp = Disp32At(m, 8);
+    g_wheelSuspOff = suspComp;
     g_wheelAngOff = suspComp + 8;
     g_wheelVelOff = suspComp + 0xC;
   }
@@ -307,6 +310,46 @@ void WriteWheelSteer(int vehicle, const float *angles, int count) {
   }
 #else
   (void)vehicle; (void)angles; (void)count; // no steer backend under FiveM
+#endif
+}
+
+bool SuspAvailable() {
+#ifdef BUILD_FIVEM
+  return false; // no suspension-compression native under FiveM
+#else
+  return g_ok && !g_fivem && g_wheelSuspOff != 0;
+#endif
+}
+
+int ReadWheelSusp(int vehicle, float *out, int maxCount) {
+#ifndef BUILD_FIVEM
+  uint8_t *base = VehBase(vehicle);
+  if (!base || g_wheelSuspOff == 0 || g_fivem) return 0;
+  int n = WheelCount(vehicle);
+  if (n > maxCount) n = maxCount;
+  for (int i = 0; i < n; ++i) {
+    uint8_t *w = WheelPtr(base, i);
+    out[i] = w ? *reinterpret_cast<float *>(w + g_wheelSuspOff) : 0.0f;
+  }
+  return n;
+#else
+  (void)vehicle; (void)out; (void)maxCount;
+  return 0;
+#endif
+}
+
+void WriteWheelSusp(int vehicle, const float *comp, int count) {
+#ifndef BUILD_FIVEM
+  uint8_t *base = VehBase(vehicle);
+  if (!base || g_wheelSuspOff == 0 || g_fivem) return;
+  int n = WheelCount(vehicle);
+  if (count < n) n = count;
+  for (int i = 0; i < n; ++i) {
+    uint8_t *w = WheelPtr(base, i);
+    if (w) *reinterpret_cast<float *>(w + g_wheelSuspOff) = comp[i];
+  }
+#else
+  (void)vehicle; (void)comp; (void)count;
 #endif
 }
 

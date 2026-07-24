@@ -199,7 +199,11 @@ void IGCS_TryConnect() {
   HMODULE modules[512];
   DWORD cbNeeded;
   if (EnumProcessModules(hProcess, modules, sizeof(modules), &cbNeeded)) {
-    for (DWORD i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
+    // cbNeeded is the number of bytes REQUIRED, which can exceed our buffer when
+    // the process has more than 512 modules loaded — clamp so we never index
+    // past modules[].
+    DWORD filled = cbNeeded < sizeof(modules) ? cbNeeded : (DWORD)sizeof(modules);
+    for (DWORD i = 0; i < filled / sizeof(HMODULE); i++) {
       auto connectFunc = (ConnectFromCameraToolsFunc)GetProcAddress(
           modules[i], "connectFromCameraTools");
       if (!connectFunc)

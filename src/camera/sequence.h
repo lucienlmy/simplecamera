@@ -232,6 +232,17 @@ void Sequence_AddEvent(EffectKind kind, float t, float value, bool ramp);
 void Sequence_DeleteEvent(int eventIdx);
 void Sequence_SortByTime(); // re-sort both arrays after time edits
 
+// Duplicate keyframe `poseIdx`: the copy lands at the midpoint to the next
+// keyframe (shaping a segment), or +2s past the end when duplicating the last
+// one (extending the shot with a hold). Returns the copy's post-sort index,
+// or -1 on failure.
+int Sequence_DuplicatePose(int poseIdx);
+
+// Re-space all middle keyframes evenly between the first and last one's times
+// (constant-speed pass). First/last keep their t; events are untouched.
+// Returns how many keyframes were re-timed (0 when fewer than 3 poses).
+int Sequence_DistributeTimes();
+
 // Scale the time of all pose keyframes + effect events by `factor` (>1 = slower/
 // longer, <1 = faster/shorter). Rewrites the keyframe t values in place.
 void Sequence_ScaleTimes(float factor);

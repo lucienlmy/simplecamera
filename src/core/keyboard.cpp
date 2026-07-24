@@ -6,7 +6,7 @@
 #include "keyboard.h"
 #include "TextInput.h" // forward keystrokes to the menu's inline value editor
 
-const int KEYS_SIZE = 255;
+const int KEYS_SIZE = 256; // virtual-key codes span 0x00..0xFF (256 values)
 
 struct {
   DWORD time;
