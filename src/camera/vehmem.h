@@ -16,11 +16,16 @@
         angle/angvel deltas differ. Init() tries each and lets whichever matches
         the running game select the math, so no game-version branching is needed.
 
-        FiveM build: FiveM dislikes raw module pattern scans (its image is managed
-        and getScriptHandleBaseAddress writes are unreliable there), so when we
-        detect FiveM (g_IsFiveM) we skip the scan entirely and drive the wheels
-        through FiveM's CFX wheel natives instead — same public API, different
-        backend. The natives used (hash = joaat of the name):
+        FiveM runs the MEMORY backend too, as of the call-site anchor described
+        in vehmem.cpp. It was on the natives fallback for a while because FiveM
+        does not export getScriptHandleBaseAddress and the resolver pattern was
+        cut from a function body, which the optimiser reshapes every build; an
+        anchor on a CALL to it holds across builds and resolves there fine.
+
+        The natives path below is therefore a fallback that should not normally
+        be reached. It is kept because a build whose offsets have moved still
+        needs an answer, and on FiveM these exist where the memory route may not
+        (hash = joaat of the name):
           GET_VEHICLE_NUMBER_OF_WHEELS    0xEDF4B0FC  (Vehicle) -> int
           GET_VEHICLE_WHEEL_Y_ROTATION    0x2EA4AFFE  (Vehicle, wheel) -> float
           SET_VEHICLE_WHEEL_Y_ROTATION    0xC6C2171F  (Vehicle, wheel, radians)

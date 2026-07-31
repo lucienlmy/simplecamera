@@ -58,10 +58,27 @@ self-documenting — this README sticks to setup and the bigger-picture workflow
 ## Requirements
 
 - **Grand Theft Auto V** (the build supported by your ScriptHookV — i.e. the
-  classic/legacy version of the game).
+  classic/legacy version of the game). Singleplayer or **FiveM**.
 - **[ScriptHookV](http://www.dev-c.com/gtav/scripthookv/)** by Alexander Blade.
 - *(Optional, only for rendering / advanced photo tools)* **ReShade with add-on
   support** and the **IgcsConnector** add-on.
+
+### FiveM
+
+Supported. Drop `SimpleCamera.asi` into FiveM's `plugins\` folder — same build as
+singleplayer, no separate download. `SimpleCamera.log` reports `FiveM=yes` when
+it detects the host.
+
+Two things behave differently there, neither of them a bug in the mod:
+
+- **A server can override the camera, time and weather from its own scripts**,
+  and it will win. That is multiplayer, not this mod.
+- **Follow/aim targeting and "stream around camera" do nothing.** FiveM's
+  ScriptHookV shim stubs out `worldGetAllVehicles/Peds/Objects`, so anything that
+  enumerates world entities has nothing to work with.
+
+Everything else — free camera, sequences, vehicle clips with wheel rotation,
+menu, capture — works as it does in singleplayer.
 
 ---
 

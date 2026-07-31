@@ -15,6 +15,8 @@
 #include "scmenu.h"
 #include "sequence.h"
 #include "vehicleclip.h"
+#include "vehmem.h"
+#include "log.h"
 
 #include "external\scripthook_sdk\inc\natives.h"
 
@@ -28,6 +30,23 @@
 void main() {
   // Detect if running in FiveM
   DetectFiveM();
+
+  Log("script: main() entered, FiveM=%s", g_IsFiveM ? "yes" : "no");
+
+  // FiveM is a supported host. The only thing to know about it is that a server
+  // can override the camera, time and weather from its own scripts and will win
+  // - which is a property of multiplayer, not of this mod.
+
+  // Resolve the vehicle-memory backend HERE rather than lazily on the first
+  // ghost spawn.
+  //
+  // Two reasons, both diagnostic. It is the only pattern scan in the mod, so
+  // running it at a known point means a crash inside it is attributable
+  // instead of appearing minutes later; and the log line it emits states which
+  // backend a given host actually got, which is the thing that was previously
+  // impossible to find out without a debugger. Init() is idempotent, so the
+  // ghost-spawn call is now just a no-op re-check.
+  VehMem::Init();
 
   // Load INI settings — populates camera/shake/DoF/misc tunables from
   // SimpleCamera.ini, falling back to the global initializers in camera.cpp

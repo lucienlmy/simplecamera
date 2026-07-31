@@ -139,8 +139,17 @@ bool g_ClearPeds = false;     // World & Scene: keep the map clear of ambient pe
 //  Functions
 // ============================================================
 
+// Detect the FiveM host. Gates which clock/weather natives are legal and
+// whether VehMem may use the CFX wheel natives, so a wrong answer here is
+// expensive.
+//
+// Test MODULES LOADED IN THE GAME PROCESS, never the process name: FiveM runs
+// the game in a subprocess called FiveM_b<build>_GTAProcess.exe, so a check for
+// "FiveM.exe" is always NULL there.
 void DetectFiveM() {
-  g_IsFiveM = (GetModuleHandleA("FiveM.exe") != NULL ||
+  g_IsFiveM = (GetModuleHandleA("citizen-game-main.dll") != NULL ||
+               GetModuleHandleA("asi-five.dll") != NULL ||
+               GetModuleHandleA("scripting-gta.dll") != NULL ||
                GetModuleHandleA("CitizenGame.dll") != NULL);
 }
 
