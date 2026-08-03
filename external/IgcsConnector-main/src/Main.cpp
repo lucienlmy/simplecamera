@@ -223,46 +223,64 @@ static void sc_fxCaptureTick(effect_runtime* runtime)
 	std::vector<uint8_t> shot(static_cast<size_t>(width) * height * 4);
 	runtime->capture_screenshot(shot.data());
 
-	// capture_screenshot() returns raw back-buffer bytes, so the channel order
-	// follows the swapchain format: BGRA on vanilla GTA Enhanced (DX12), but
-	// RGBA on other setups (e.g. FiveM) — assuming one fixed order inverts
-	// red/blue on the other. Auto queries the actual format; the ASI can also
-	// force either order via channelOrder (1 = RGBA, 2 = BGRA).
-	bool swapRB;
+	// Does capture_screenshot() hand back RGBA or BGRA? It depends on the
+	// SWAPCHAIN, and it is knowable rather than guessable.
+	//
+	// The addon API returns the back buffer's OWN channel order. Its header says
+	// so - "bpp is the number of bytes per pixel of the back buffer format" - and
+	// runtime.cpp shows why:
+	//
+	//     bool capture_screenshot(void *pixels) final {
+	//         return get_texture_data(..., _back_buffer_format);
+	//     }
+	//
+	// get_texture_data only converts when asked for a DIFFERENT output format:
+	//
+	//     if (quantization_format == intermediate_format)
+	//         -> straight copy, no conversion
+	//     if (quantization_format == api::format::r8g8b8a8_unorm)
+	//         case api::format::b8g8r8a8_unorm:
+	//             // Format is BGRA, but output should be RGBA, so flip channels
+	//
+	// capture_screenshot passes the back buffer format as the quantization
+	// format, so on a BGRA swapchain the two are equal, the first branch wins,
+	// and the bytes arrive BGRA. ReShade's own screenshots are correct because
+	// they pass r8g8b8a8_unorm explicitly and therefore DO hit the flip.
+	//
+	// A previous version of this file concluded the opposite - that the flip
+	// always happens - from reading that `case` without the `if` wrapping it,
+	// and hardcoded "never swap". That is correct only on RGBA swapchains. On
+	// GTA V Enhanced it produced a measurable red/blue swap: comparing a render
+	// against a ReShade screenshot of the same scene, the render's R-G matched
+	// the screenshot's B-G and vice versa, and R-B came out +4.01 where an
+	// unswapped capture would have given -3.78.
+	//
+	// So: read the format. format_to_default_typed first, because ReShade
+	// promotes x8 to a8 before storing _back_buffer_format (runtime.cpp:384) and
+	// a raw comparison would miss b8g8r8x8.
+	bool swapRB = false;
 	const uint32_t orderMode = g_scFxBlock->channelOrder;
 	if (orderMode == 1)
 	{
-		swapRB = false;
+		swapRB = false;  // forced RGBA
 	}
 	else if (orderMode == 2)
 	{
-		swapRB = true;
+		swapRB = true;   // forced BGRA
 	}
-	else // Auto
+	else if (reshade::api::device *const dev = runtime->get_device())
 	{
-		swapRB = false;
-		device* const dev = runtime->get_device();
-		const resource backBuffer = runtime->get_current_back_buffer();
-		if (dev != nullptr && backBuffer.handle != 0)
+		const reshade::api::resource bb = runtime->get_current_back_buffer();
+		if (bb != 0)
 		{
-			switch (dev->get_resource_desc(backBuffer).texture.format)
-			{
-			case format::b8g8r8a8_typeless:
-			case format::b8g8r8a8_unorm:
-			case format::b8g8r8a8_unorm_srgb:
-			case format::b8g8r8x8_typeless:
-			case format::b8g8r8x8_unorm:
-			case format::b8g8r8x8_unorm_srgb:
-			case format::b10g10r10a2_typeless:
-			case format::b10g10r10a2_unorm:
-			case format::b10g10r10a2_uint:
-				swapRB = true;
-				break;
-			default:
-				break;
-			}
+			const reshade::api::format fmt = reshade::api::format_to_default_typed(
+				dev->get_resource_desc(bb).texture.format, 0);
+			swapRB = (fmt == reshade::api::format::b8g8r8a8_unorm ||
+			          fmt == reshade::api::format::b8g8r8x8_unorm ||
+			          fmt == reshade::api::format::b10g10r10a2_unorm);
 		}
 	}
+
 	const uint32_t ri = swapRB ? 2u : 0u; // byte index of red within each pixel
 	const uint32_t bi = swapRB ? 0u : 2u; // byte index of blue
 
