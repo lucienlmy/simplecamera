@@ -143,6 +143,7 @@ void DepthOfFieldController::writeVariableStateToShader(reshade::api::effect_run
 void DepthOfFieldController::loadIniFileData(CDataFile& iniFile)
 {
 	loadFloatFromIni(iniFile, "MaxBokehSize", &_maxBokehSize);
+	loadFloatFromIni(iniFile, "ShutterMs", &_shutterMs);
 	loadFloatFromIni(iniFile, "HighlightBoostFactor", &_highlightBoostFactor);
 	loadFloatFromIni(iniFile, "HighlightGammaFactor", &_highlightGammaFactor);
 	loadFloatFromIni(iniFile, "MagnificationAreaWidth", &_magnificationSettings.WidthMagnifierArea);
@@ -177,6 +178,7 @@ void DepthOfFieldController::loadIniFileData(CDataFile& iniFile)
 void DepthOfFieldController::saveIniFileData(CDataFile& iniFile)
 {
 	iniFile.SetFloat("MaxBokehSize", _maxBokehSize, "", "DepthOfField");
+	iniFile.SetFloat("ShutterMs", _shutterMs, "", "DepthOfField");
 	iniFile.SetFloat("HighlightBoostFactor", _highlightBoostFactor, "", "DepthOfField");
 	iniFile.SetFloat("HighlightGammaFactor", _highlightGammaFactor, "", "DepthOfField");
 	iniFile.SetFloat("MagnificationAreaWidth", _magnificationSettings.WidthMagnifierArea, "", "DepthOfField");
@@ -309,7 +311,14 @@ void DepthOfFieldController::performRenderFrameSetupWork()
 	if(_currentStepFrame < _cameraSteps.size())
 	{
 		const auto& currentStepFrameData = _cameraSteps[_currentStepFrame];
-		_cameraToolsConnector.moveCameraMultishot(currentStepFrameData.xDelta, currentStepFrameData.yDelta, 0.0f, true);
+		// The timed form falls back to the plain one inside the connector when
+		// the tools don't implement it, so there is no branch to keep in step
+		// here. At shutter 0 the offset is 0 and the two are identical anyway.
+		_cameraToolsConnector.moveCameraMultishotTimed(currentStepFrameData.xDelta, currentStepFrameData.yDelta, 0.0f, true,
+		                                               _shutterMs * currentStepFrameData.timeFraction);
+		// A step has been handed over; until the tools confirm it has landed,
+		// blending would accumulate the PREVIOUS sample's frame.
+		_awaitingSampleReady = true;
 	}
 	if(_currentBlendFrame >= 0)
 	{
@@ -354,6 +363,39 @@ void DepthOfFieldController::handlePresentBeforeReshadeEffects()
 			break;
 		case DepthOfFieldRenderFrameState::FrameWait:
 			{
+				// The camera tools get the first say. A fixed frame count has to
+				// cover two unrelated delays at once - the tools' latency in
+				// servicing the step, and the engine's settle after it - and only
+				// the first is theirs to report. Asking removes it from the guess,
+				// which leaves the counter below meaning one thing instead of two.
+				//
+				// Answers true immediately on tools without the query, so this is
+				// a no-op for every camera tool that predates the extension.
+				if(_awaitingSampleReady)
+				{
+					if(!_cameraToolsConnector.querySampleReady() && _sampleReadyWaitCounter < c_maxSampleReadyWait)
+					{
+						// Not landed yet. Hold the settle counter where it is:
+						// spending it while the step is still in flight is exactly
+						// how a frame from the wrong instant ends up blended.
+						_sampleReadyWaitCounter++;
+						break;
+					}
+					// Bounded, because a render that hangs with no way out is a worse
+					// failure than one blended frame from the wrong instant. Tools can
+					// stop answering for reasons that are nobody's bug - the game
+					// pausing, a level load, the session being torn down underneath
+					// us - and none of those should strand the user in a progress bar.
+					if(_sampleReadyWaitCounter >= c_maxSampleReadyWait)
+					{
+						reshade::log::message(reshade::log::level::warning,
+							"DoF: camera tools did not report the sample ready in time; blending anyway. "
+							"If the result shows doubled images, the tools are servicing steps too slowly.");
+					}
+					_awaitingSampleReady = false;
+					_sampleReadyWaitCounter = 0;
+				}
+
 				// check if counter is 0. If so, switch to next state, if not, decrease and do nothing
 				if(_frameWaitCounter <= 0)
 				{
@@ -689,6 +731,50 @@ void DepthOfFieldController::renormalizeBokehWeights()
 }
 
 
+void DepthOfFieldController::assignSampleTimes()
+{
+	const size_t n = _cameraSteps.size();
+	if(0 == n)
+	{
+		return;
+	}
+
+	// Stratified, then shuffled INDEPENDENTLY of the point order.
+	//
+	// Both halves matter and they fix different things.
+	//
+	// Stratified - fraction i gets (i + 0.5) / n - because the exposure has to
+	// be covered EVENLY. Drawing each sample's time at random instead leaves
+	// clumps and gaps in the interval, and a gap in a shutter is a place the
+	// subject was never photographed: the smear comes out beaded rather than
+	// continuous, which is the exact artefact that makes cheap motion blur look
+	// like a stack of ghosts.
+	//
+	// Shuffled because the sample list is built centre-outward, ring by ring.
+	// Handing out the fractions in order would therefore put early time on the
+	// inner rings and late time on the outer ones, and time would be a function
+	// of aperture radius. A moving object's trail then renders as a radial
+	// sweep - tight bokeh at one end of the smear, wide at the other - which
+	// reads as a rendering fault rather than as motion.
+	//
+	// The shuffle is over the FRACTIONS, not the points. Shuffling the points
+	// would work equally well for this but it is not ours to do: the render
+	// order is the user's setting, and a session set to inner-to-outer must
+	// still walk the aperture in that order.
+	std::vector<float> fractions(n);
+	for(size_t i = 0; i < n; i++)
+	{
+		fractions[i] = (static_cast<float>(i) + 0.5f) / static_cast<float>(n);
+	}
+	std::ranges::shuffle(fractions, std::mt19937(std::random_device()()));
+
+	for(size_t i = 0; i < n; i++)
+	{
+		_cameraSteps[i].timeFraction = fractions[i];
+	}
+}
+
+
 void DepthOfFieldController::applyRenderOrder()
 {
 	switch(_renderOrder)
@@ -715,10 +801,14 @@ void DepthOfFieldController::calculateShapePoints()
 		case DepthOfFieldBlurType::ApertureShape:
 			createApertureShapedDoFPoints();
 			break;
-		case DepthOfFieldBlurType::Circular: 
+		case DepthOfFieldBlurType::Circular:
 			createCircleDoFPoints();
 			break;
 	}
+
+	// After the geometry is settled, so the fractions land on the points in the
+	// order they will actually be walked.
+	assignSampleTimes();
 }
 
 
@@ -741,6 +831,9 @@ void DepthOfFieldController::startRender(reshade::api::effect_runtime* runtime)
 	_blendFrame = false;
 	_blendFactor = 0.0f;
 	_currentStepFrame = 0;
+	// Never inherit a wait from a session that was cancelled mid-step.
+	_awaitingSampleReady = false;
+	_sampleReadyWaitCounter = 0;
 	switch(_frameWaitType)
 	{
 		case DepthOfFieldFrameWaitType::Classic:

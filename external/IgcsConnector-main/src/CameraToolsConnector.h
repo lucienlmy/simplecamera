@@ -68,6 +68,37 @@ typedef void(*IGCS_MoveCameraMultishot)(float stepLeftRight, float stepUpDown, f
 /// </summary>
 typedef void(*IGCS_EndScreenshotSession)();
 
+// ---------------------------------------------------------------------------
+//  OPTIONAL EXTENSIONS
+//
+//  Both are resolved with GetProcAddress and may be absent: camera tools that
+//  predate them keep working unchanged, and the controller falls back to the
+//  behaviour it had before they existed. Neither may ever become required.
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Multishot step that additionally carries the point in the SHUTTER interval
+/// this sample belongs to, letting the tools advance the game's own clock so
+/// one accumulation covers an exposure as well as an aperture.
+/// </summary>
+/// <param name="timeOffsetMs">Milliseconds after the instant the session
+/// started. 0 for a sample at the start of the exposure. The tools decide what
+/// a millisecond of scene time means and how to reach it.</param>
+typedef void(*IGCS_MoveCameraMultishotTimed)(float stepLeftRight, float stepUpDown, float fovDegrees,
+                                             bool fromStartPosition, float timeOffsetMs);
+
+/// <summary>
+/// Asks the camera tools whether the frame currently on screen corresponds to
+/// the last step they were given.
+/// </summary>
+/// <returns>Non-zero when the step has been applied and the frame is safe to
+/// blend. Zero means "not yet - ask again next frame".</returns>
+/// <remarks>A fixed frame-wait has to cover two unrelated delays at once: the
+/// tools' own latency in servicing a step, which varies with frame rate and
+/// thread timing, and the engine's settle after it. Only the tools can answer
+/// the first. The frame-wait still covers the second.</remarks>
+typedef int(*IGCS_QuerySampleReady)();
+
 
 /// <summary>
 /// Class which controls a connection with the camera tools. It's created and started by main and passed onto controllers which need to connect to the camera tools. 
@@ -110,6 +141,21 @@ public:
 	/// <param name="fromStartPosition">If true the values specified will be relative to the start location of the session, otherwise to the current location of the camera</param>
 	void moveCameraMultishot(float stepLeftRight, float stepUpDown, float fovDegrees, bool fromStartPosition);
 	/// <summary>
+	/// As moveCameraMultishot, but also tells the tools where in the shutter interval this sample sits.
+	/// Falls back to the untimed call when the tools don't implement it, so callers never have to check.
+	/// </summary>
+	void moveCameraMultishotTimed(float stepLeftRight, float stepUpDown, float fovDegrees, bool fromStartPosition, float timeOffsetMs);
+	/// <summary>
+	/// True when the connected tools can advance the game clock per sample.
+	/// </summary>
+	bool supportsTimedMultishot() const { return nullptr != _igcs_MoveCameraMultishotTimedFunc; }
+	/// <summary>
+	/// True when the frame on screen matches the last step handed to the tools.
+	/// Answers TRUE when the tools don't implement the query, so a caller that gates on
+	/// this behaves exactly as it did before the extension existed.
+	/// </summary>
+	bool querySampleReady();
+	/// <summary>
 	/// Ends the active screenshot session, restoring camera data if required.
 	/// </summary>
 	void endScreenshotSession();
@@ -127,5 +173,11 @@ private:
 	IGCS_MoveCameraPanorama _igcs_MoveCameraPanoramaFunc = nullptr;
 	IGCS_MoveCameraMultishot _igcs_MoveCameraMultishotFunc = nullptr;
 	IGCS_EndScreenshotSession _igcs_EndScreenshotSessionFunc = nullptr;
+
+	// Optional. Deliberately NOT part of cameraToolsConnected(): a tool without
+	// them is a fully working tool, and requiring them would drop every existing
+	// camera tool on the floor the moment this build shipped.
+	IGCS_MoveCameraMultishotTimed _igcs_MoveCameraMultishotTimedFunc = nullptr;
+	IGCS_QuerySampleReady _igcs_QuerySampleReadyFunc = nullptr;
 };
 

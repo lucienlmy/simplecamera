@@ -220,7 +220,74 @@ static void sc_fxCaptureTick(effect_runtime* runtime)
 		return;
 	}
 
-	std::vector<uint8_t> shot(static_cast<size_t>(width) * height * 4);
+	// The back buffer FORMAT decides two separate things - how many bytes
+	// capture_screenshot is going to write, and what order the channels arrive
+	// in - so it is read once, before anything is sized.
+	reshade::api::format bbFormat = reshade::api::format::unknown;
+	if (reshade::api::device *const dev = runtime->get_device())
+	{
+		const reshade::api::resource bb = runtime->get_current_back_buffer();
+		if (bb != 0)
+		{
+			// format_to_default_typed first: ReShade promotes x8 to a8 before
+			// storing _back_buffer_format, and a raw compare would miss b8g8r8x8.
+			bbFormat = reshade::api::format_to_default_typed(
+				dev->get_resource_desc(bb).texture.format, 0);
+		}
+	}
+
+	// SIZE THE BUFFER BY THE FORMAT, not by a hardcoded four.
+	//
+	// The API contract is explicit: "Pointer to an array of width * height * bpp
+	// bytes ... where bpp is the number of bytes per pixel of the BACK BUFFER
+	// FORMAT". A fixed 4 is only correct while the swapchain is 8-bit.
+	//
+	// On an HDR swapchain it is not. r16g16b16a16_float is EIGHT bytes per pixel,
+	// so a width*height*4 buffer is overrun by exactly its own length - a heap
+	// corruption that depends on the user's display settings and would surface
+	// as a crash somewhere else entirely. Enabling HDR is all it takes.
+	const uint32_t bpp = reshade::api::format_row_pitch(bbFormat, 1);
+
+	// Say what was detected, once. The whole channel-order question is decided
+	// by this number and it is otherwise invisible - a swapped render and a
+	// correct one differ by nothing a log would normally show. It also answers
+	// "do the DX11 and DX12 builds differ" by observation instead of by
+	// argument, which is the only way that question stays answered.
+	{
+		static reshade::api::format loggedFormat = reshade::api::format::unknown;
+		static bool everLogged = false;
+		if (!everLogged || bbFormat != loggedFormat)
+		{
+			everLogged = true;
+			loggedFormat = bbFormat;
+			char msg[192];
+			snprintf(msg, sizeof(msg),
+				"FxCapture: back buffer format %u, %u byte(s)/pixel - capture reads %s",
+				static_cast<uint32_t>(bbFormat), bpp,
+				(bbFormat == reshade::api::format::b8g8r8a8_unorm ||
+				 bbFormat == reshade::api::format::b8g8r8x8_unorm) ? "BGRA"
+				: (bbFormat == reshade::api::format::r10g10b10a2_unorm ||
+				   bbFormat == reshade::api::format::b10g10r10a2_unorm) ? "packed 10-bit"
+				: (bpp == 4) ? "RGBA" : "an unsupported layout");
+			reshade::log::message(reshade::log::level::info, msg);
+		}
+	}
+
+	if (bpp == 0)
+	{
+		static bool warnedFormat = false;
+		if (!warnedFormat)
+		{
+			warnedFormat = true;
+			reshade::log::message(reshade::log::level::error,
+				"FxCapture: could not determine the back buffer format; capture disabled.");
+		}
+		g_scFxBlock->status = 1;
+		g_scFxBlock->ackId = req;
+		return;
+	}
+
+	std::vector<uint8_t> shot(static_cast<size_t>(width) * height * bpp);
 	runtime->capture_screenshot(shot.data());
 
 	// Does capture_screenshot() hand back RGBA or BGRA? It depends on the
@@ -268,21 +335,64 @@ static void sc_fxCaptureTick(effect_runtime* runtime)
 	{
 		swapRB = true;   // forced BGRA
 	}
-	else if (reshade::api::device *const dev = runtime->get_device())
+	else
 	{
-		const reshade::api::resource bb = runtime->get_current_back_buffer();
-		if (bb != 0)
-		{
-			const reshade::api::format fmt = reshade::api::format_to_default_typed(
-				dev->get_resource_desc(bb).texture.format, 0);
-			swapRB = (fmt == reshade::api::format::b8g8r8a8_unorm ||
-			          fmt == reshade::api::format::b8g8r8x8_unorm ||
-			          fmt == reshade::api::format::b10g10r10a2_unorm);
-		}
+		swapRB = (bbFormat == reshade::api::format::b8g8r8a8_unorm ||
+		          bbFormat == reshade::api::format::b8g8r8x8_unorm ||
+		          bbFormat == reshade::api::format::b10g10r10a2_unorm);
 	}
 
-	const uint32_t ri = swapRB ? 2u : 0u; // byte index of red within each pixel
-	const uint32_t bi = swapRB ? 0u : 2u; // byte index of blue
+	// Everything below reads four bytes per pixel, one 8-bit channel each.
+	//
+	// A 10-bit swapchain is also four bytes per pixel but is NOT that layout -
+	// it is three packed 10-bit bitfields plus two bits of alpha, and
+	// capture_screenshot hands it over verbatim because it quantises to the back
+	// buffer's own format. Reading byte 0 as red there is not a channel swap,
+	// it is the bottom eight bits of red mixed with nothing. Unpack it into the
+	// layout the rest of the function expects, in place - the sizes match, so
+	// this costs one pass and no allocation.
+	const bool tenBit = (bbFormat == reshade::api::format::r10g10b10a2_unorm ||
+	                     bbFormat == reshade::api::format::b10g10r10a2_unorm);
+	if (tenBit)
+	{
+		for (uint32_t i = 0; i < width * height; ++i)
+		{
+			uint32_t v = 0;
+			std::memcpy(&v, &shot[4 * i], sizeof(v));
+			// >> 2 takes the 10-bit range (0-1023) to 8-bit (0-255), the same
+			// reduction ReShade applies on this path.
+			const uint8_t c0 = static_cast<uint8_t>(( v         & 0x3FFu) >> 2);
+			const uint8_t c1 = static_cast<uint8_t>(((v >> 10)  & 0x3FFu) >> 2);
+			const uint8_t c2 = static_cast<uint8_t>(((v >> 20)  & 0x3FFu) >> 2);
+			// Which end holds red is the same question swapRB already answers,
+			// so a forced order override keeps working here too.
+			shot[4 * i + 0] = swapRB ? c2 : c0;
+			shot[4 * i + 1] = c1;
+			shot[4 * i + 2] = swapRB ? c0 : c2;
+			shot[4 * i + 3] = 0xFF;
+		}
+	}
+	else if (bpp != 4)
+	{
+		// A float or 16-bit-per-channel back buffer - an HDR swapchain. There is
+		// no honest 8-bit answer without tonemapping it, and inventing one here
+		// would silently change what the renderer produces. Refuse loudly.
+		static bool warnedHdr = false;
+		if (!warnedHdr)
+		{
+			warnedHdr = true;
+			reshade::log::message(reshade::log::level::error,
+				"FxCapture: the back buffer is not an 8-bit format (HDR swapchain?); "
+				"capture is disabled. Render in SDR, or turn HDR off for the render.");
+		}
+		g_scFxBlock->status = 1;
+		g_scFxBlock->ackId = req;
+		return;
+	}
+
+	// After the unpack above the data is plain RGBA, so the swap is spent.
+	const uint32_t ri = (swapRB && !tenBit) ? 2u : 0u; // byte index of red
+	const uint32_t bi = (swapRB && !tenBit) ? 0u : 2u; // byte index of blue
 
 	uint32_t status = 0;
 
@@ -900,6 +1010,42 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 							if(changed)
 							{
 								g_depthOfFieldController.setNumberOfFramesToWaitPerFrame(numberOfFramesToWaitPerFrame);
+							}
+
+							// Shutter. Only offered when the connected camera tools can
+							// actually step the clock - a control that silently does
+							// nothing is worse than an absent one, and the tools that
+							// can do this are the exception rather than the rule.
+							if(g_depthOfFieldController.supportsShutter())
+							{
+								ImGui::SeparatorText("Shutter");
+								float shutterMs = g_depthOfFieldController.getShutterMs();
+								if(ImGui::DragFloat("Shutter (ms)", &shutterMs, 0.1f, 0.0f, 500.0f, "%.1f"))
+								{
+									g_depthOfFieldController.setShutterMs(shutterMs);
+								}
+								if(ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+								{
+									ImGui::SetTooltip(
+										"How much SCENE TIME this accumulation covers.\n\n"
+										"0 freezes the clock: every sample is the same instant from a\n"
+										"different point on the lens, so only the aperture varies. That is\n"
+										"the classic behaviour and the right answer for a locked-off shot.\n\n"
+										"Above 0 the camera tools advance the game's own clock per sample,\n"
+										"so one pass produces depth of field AND motion blur. 16.7 is a\n"
+										"1/60s exposure, 33.3 is 1/30s.\n\n"
+										"Sample times are stratified across the interval and shuffled so\n"
+										"they do not correlate with the aperture rings - without that a\n"
+										"moving subject smears radially instead of evenly.\n\n"
+										"Costs no extra samples. A long shutter over few samples is what\n"
+										"discrete ghosting looks like, so raise quality with it.");
+								}
+								if(shutterMs > 0.0f)
+								{
+									const int steps = g_depthOfFieldController.getTotalNumberOfStepsToTake();
+									ImGui::TextDisabled("%d samples over %.1f ms = %.2f ms apart",
+										steps, shutterMs, steps > 0 ? shutterMs / (float)steps : 0.0f);
+								}
 							}
 
 							ImGui::SeparatorText("Magnifier");

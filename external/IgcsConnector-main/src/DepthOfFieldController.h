@@ -59,6 +59,14 @@ class DepthOfFieldController
 		float yAlignmentDelta = 0.0f;
 
 		float sampleWeightRGB[3] = {1.0f, 1.0f, 1.0f};
+
+		// Where in the shutter interval this sample sits, 0..1. Appended LAST so
+		// the aggregate initialisers that build these keep compiling unchanged.
+		//
+		// Assigned in a separate pass from the geometry, and deliberately so:
+		// see assignSampleTimes(). It must NOT correlate with the ring this
+		// point belongs to.
+		float timeFraction = 0.0f;
 	};
 
 	struct MagnifierSettings
@@ -225,6 +233,25 @@ public:
 
 	// getters
 	DepthOfFieldRenderOrder getRenderOrder() { return _renderOrder; }
+	/// <summary>
+	/// How much SCENE TIME one accumulation covers, in milliseconds. 0 freezes the clock,
+	/// which is the classic behaviour: every sample is the same instant from a different
+	/// point on the lens. Above 0 the session integrates an exposure as well as an aperture.
+	/// </summary>
+	/// <remarks>Only has an effect when the connected camera tools implement the timed
+	/// multishot step. The UI hides the control when they don't, rather than offering a
+	/// setting that silently does nothing.</remarks>
+	void setShutterMs(float newValue)
+	{
+		_shutterMs = IGCS::Utils::clampEx(newValue, 0.0f, 500.0f);
+		assignSampleTimes();
+	}
+	float getShutterMs() { return _shutterMs; }
+	/// <summary>
+	/// True when the connected camera tools can advance the game clock, i.e. when the
+	/// shutter is something the UI should offer at all.
+	/// </summary>
+	bool supportsShutter() { return _cameraToolsConnector.supportsTimedMultishot(); }
 	float getMaxBokehSize() { return _maxBokehSize; }
 	float getXFocusDelta() { return _focusDelta; }
 	int getQuality() { return _quality; }
@@ -274,6 +301,10 @@ private:
 	/// Create a set of circular points using nested circles, which are used to build the camera steps array
 	/// </summary>
 	void createCircleDoFPoints();
+	/// <summary>
+	/// Spreads the shutter interval over the samples, after their geometry and order are final.
+	/// </summary>
+	void assignSampleTimes();
 	void applyRenderOrder();
 	void renormalizeBokehWeights();
 	void createApertureShapedDoFPoints();
@@ -333,6 +364,10 @@ private:
 	float _blendFactor = 0.0f;			// for the shader, the blend factor to use when blending a frame
 	float _xAlignmentDelta = 0.0f;		// for the shader, the alignment x delta to use
 	float _yAlignmentDelta = 0.0f;		// for the shader, the alignment y delta to use
+	// Scene time one accumulation covers, in ms. 0 = a frozen instant, the
+	// classic behaviour and the default: nothing changes for anyone who does
+	// not go looking for this.
+	float _shutterMs = 0.0f;
 	float _highlightBoostFactor = 0.9f;
 	float _highlightGammaFactor = 2.2f;
 	float _sphericalAberrationDimFactor = 0.5f; //dim factor as intensity, 0% to 100% for center sample
@@ -353,6 +388,16 @@ private:
 
 	DepthOfFieldBlurType _blurType = DepthOfFieldBlurType::Circular;
 	DepthOfFieldRenderFrameState _renderFrameState = DepthOfFieldRenderFrameState::Off;
+	// A step has been handed to the camera tools and they have not yet confirmed
+	// the frame on screen reflects it. Always false against tools without the
+	// query, which report ready immediately.
+	bool _awaitingSampleReady = false;
+	// Frames spent waiting on one such answer, and the point at which we stop
+	// waiting for it. Roughly two seconds at 60fps - long enough to cover a
+	// hitch or a streaming stall, short enough that a session which will never
+	// get an answer still finishes.
+	int _sampleReadyWaitCounter = 0;
+	static constexpr int c_maxSampleReadyWait = 120;
 	int _frameWaitCounter = 0;	// When 0 move the frameblend state to the next state, otherwise decrease
 	int _currentStepFrame = -1;		// < 0: no frame, >= 0 the current frame data to step the camera to, 0 based.
 	int _currentBlendFrame = -1;	// < 0: no frame, >= 0 the current frame data to blend, 0 based.

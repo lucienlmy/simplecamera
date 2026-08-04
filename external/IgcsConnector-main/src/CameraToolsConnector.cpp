@@ -61,6 +61,9 @@ void CameraToolsConnector::connectToCameraTools()
 			_igcs_EndScreenshotSessionFunc = (IGCS_EndScreenshotSession)GetProcAddress(moduleHandle, "IGCS_EndScreenshotSession");
 			_igcs_MoveCameraPanoramaFunc = (IGCS_MoveCameraPanorama)GetProcAddress(moduleHandle, "IGCS_MoveCameraPanorama");
 			_igcs_MoveCameraMultishotFunc = (IGCS_MoveCameraMultishot)GetProcAddress(moduleHandle, "IGCS_MoveCameraMultishot");
+			// Optional extensions - absent on tools that predate them.
+			_igcs_MoveCameraMultishotTimedFunc = (IGCS_MoveCameraMultishotTimed)GetProcAddress(moduleHandle, "IGCS_MoveCameraMultishotTimed");
+			_igcs_QuerySampleReadyFunc = (IGCS_QuerySampleReady)GetProcAddress(moduleHandle, "IGCS_QuerySampleReady");
 			break;
 		}
 	}
@@ -96,6 +99,37 @@ void CameraToolsConnector::moveCameraMultishot(float stepLeftRight, float stepUp
 		return;
 	}
 	_igcs_MoveCameraMultishotFunc(stepLeftRight, stepUpDown, fovDegrees, fromStartPosition);
+}
+
+
+void CameraToolsConnector::moveCameraMultishotTimed(float stepLeftRight, float stepUpDown, float fovDegrees, bool fromStartPosition, float timeOffsetMs)
+{
+	if(!cameraToolsConnected())
+	{
+		return;
+	}
+	if(nullptr == _igcs_MoveCameraMultishotTimedFunc)
+	{
+		// Tools can't step time. Take the plain step so the aperture walk still
+		// happens - a session without the shutter is the old behaviour, which is
+		// a perfectly good result rather than a failure.
+		_igcs_MoveCameraMultishotFunc(stepLeftRight, stepUpDown, fovDegrees, fromStartPosition);
+		return;
+	}
+	_igcs_MoveCameraMultishotTimedFunc(stepLeftRight, stepUpDown, fovDegrees, fromStartPosition, timeOffsetMs);
+}
+
+
+bool CameraToolsConnector::querySampleReady()
+{
+	if(nullptr == _igcs_QuerySampleReadyFunc)
+	{
+		// No query available: never make the caller wait on an answer nobody is
+		// going to give. The frame-wait counter alone then governs, exactly as
+		// it did before this extension existed.
+		return true;
+	}
+	return 0 != _igcs_QuerySampleReadyFunc();
 }
 
 
