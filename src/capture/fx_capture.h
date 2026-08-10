@@ -38,6 +38,34 @@ struct FxCaptureBlock {
                            // 1 = force RGBA (no swap), 2 = force BGRA (swap R/B).
                            // Appended LAST so older ASI/addon pairings keep
                            // every pre-existing field at the same offset.
+
+  // --- autofocus for the depth-of-field session (v7) --------------------
+  // Not used by Simple Camera - carried so this struct stays byte-identical
+  // to the add-on's copy and RockstarEditorPlus's, which is the only thing
+  // keeping all three able to drive the same add-on. Do not reorder or drop.
+  uint32_t afEnabled;      // ASI -> addon: 1 while the DoF panel wants autofocus
+  float    afPointX;       // focus point across the frame, 0..1
+  float    afPointY;       // and down it, 0..1
+  uint32_t afResultId;     // ASI -> addon: bumped on every answer written
+  uint32_t afStatus;       // 0 = ok, 1 = nothing hit, 2 = no camera
+  float    afDistance;     // metres to the hit ALONG THE VIEW AXIS
+  float    afTanHalfHFov;  // tan(hfov/2) for the probed frame
+
+  // --- a depth-of-field pass per rendered frame (v8) ---------------------
+  // Not used by Simple Camera. Carried so the struct stays byte-identical to
+  // the add-on's copy and RockstarEditorPlus's. Do not reorder or drop.
+  uint32_t dofSeq;         // ASI -> addon: request one DoF pass
+  float    dofShutterMs;   // the renderer owns the shutter in this mode
+  uint32_t dofDoneSeq;     // addon -> ASI: echoes dofSeq when done
+  uint32_t dofStatus;      // 0 idle, 1 running, 2 done, 3 failed
+
+  // --- the lens, pushed by the renderer (v9) -----------------------------
+  // Not used by Simple Camera; carried for layout parity. Do not reorder.
+  float    dofBokehSize;
+  uint32_t dofQuality;
+  uint32_t dofAutofocus;
+  float    dofFocusX;
+  float    dofFocusY;
 };
 #pragma pack(pop)
 

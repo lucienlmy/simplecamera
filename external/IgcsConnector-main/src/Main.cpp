@@ -89,6 +89,38 @@ struct SC_FxCaptureBlock
 	uint32_t channelOrder;  // 0 = Auto (detect back-buffer format), 1 = force RGBA,
 	                        // 2 = force BGRA. Appended LAST so mismatched ASI/addon
 	                        // versions keep all earlier fields at the same offset.
+
+	// --- autofocus for the depth-of-field session (v7) --------------------
+	// Appended for the same reason. We publish what we want focused; the ASI
+	// answers with a measured distance and the lens angle. We keep maxBokehSize
+	// on this side and do the conversion here, so dragging it re-derives focus
+	// immediately instead of waiting for a round trip.
+	uint32_t afEnabled;     // us -> ASI: 1 while the DoF panel wants autofocus
+	float    afPointX;      // us -> ASI: focus point across the frame, 0..1
+	float    afPointY;      // us -> ASI: and down it, 0..1
+
+	uint32_t afResultId;    // ASI -> us: bumped on every answer written
+	uint32_t afStatus;      // ASI -> us: 0 = ok, 1 = nothing hit, 2 = no camera
+	float    afDistance;    // ASI -> us: metres to the hit ALONG THE VIEW AXIS
+	float    afTanHalfHFov; // ASI -> us: tan(hfov/2) for the probed frame
+
+	// --- a depth-of-field pass per rendered frame (v8) ---------------------
+	// The renderer asks us for one accumulated frame instead of accumulating
+	// itself. Our finished pass is left ON SCREEN, so its ordinary capture
+	// request grabs the result - no new path or buffer on either side.
+	uint32_t dofSeq;        // ASI -> us: bumped to ask for one DoF pass
+	float    dofShutterMs;  // ASI -> us: the renderer owns the shutter here
+	uint32_t dofDoneSeq;    // us -> ASI: echoes dofSeq once the image is up
+	uint32_t dofStatus;     // us -> ASI: 0 idle, 1 running, 2 done, 3 failed
+
+	// --- the lens, pushed by the renderer (v9) -----------------------------
+	// Read once when a pass starts, never polled: the panel stays authoritative
+	// at every other moment. Shape settings stay ours - they are judged by eye.
+	float    dofBokehSize;  // aperture diameter
+	uint32_t dofQuality;    // ring count
+	uint32_t dofAutofocus;  // 1 = measure focus in the world each frame
+	float    dofFocusX;     // where to measure, 0..1 across
+	float    dofFocusY;     // and down
 };
 #pragma pack(pop)
 
@@ -686,12 +718,291 @@ void handleWorkQueue(effect_runtime* runtime)
 }
 
 
+// Autofocus exchange over the same shared block as frame capture.
+//
+// Separate from sc_fxCaptureTick, and not folded into it, for two reasons. That
+// function returns early when no capture is pending - and during a depth-of-field
+// setup pass nothing is being captured, which is exactly when focus matters. And
+// it is defined above g_depthOfFieldController, so it cannot see the controller
+// at all.
+//
+// We publish what we want focused; the connected tool answers when it has
+// measured. It bumps afResultId rather than us diffing the distance, so a
+// measurement that repeats the previous number still counts as a fresh answer -
+// which is what a stationary subject looks like.
+static void sc_fxAutofocusTick(effect_runtime* runtime)
+{
+	if (nullptr == g_scFxBlock || g_scFxBlock->magic != 0x53434658u)
+	{
+		return;
+	}
+
+	// Publish the frame size every present, not only after a capture.
+	//
+	// These used to be written in the capture path alone, which is fine for a
+	// render - something has always been captured by the time anyone reads them.
+	// A depth-of-field session captures NOTHING while it is being set up, so the
+	// other side had no aspect ratio at exactly the moment it needed one to turn
+	// a vertical field of view into a horizontal one, and answered "no camera".
+	// Same value either way; this just makes it available before the first frame
+	// is grabbed rather than after.
+	{
+		uint32_t w = 0, h = 0;
+		runtime->get_screenshot_width_and_height(&w, &h);
+		if (w > 0 && h > 0)
+		{
+			g_scFxBlock->width  = w;
+			g_scFxBlock->height = h;
+		}
+	}
+
+	const bool wantAf = g_depthOfFieldController.getAutofocusEnabled() &&
+	                    DepthOfFieldControllerState::Setup == g_depthOfFieldController.getState();
+
+	g_scFxBlock->afEnabled = wantAf ? 1u : 0u;
+	g_scFxBlock->afPointX  = g_depthOfFieldController.getAutofocusPointX();
+	g_scFxBlock->afPointY  = g_depthOfFieldController.getAutofocusPointY();
+
+	static uint32_t s_afLastResult = 0;
+	const uint32_t afResult = g_scFxBlock->afResultId;
+
+	if (!wantAf)
+	{
+		// Track the counter while idle, or switching autofocus back on replays
+		// one stale measurement from whenever it was last used.
+		s_afLastResult = afResult;
+		return;
+	}
+	if (afResult != s_afLastResult)
+	{
+		s_afLastResult = afResult;
+		g_depthOfFieldController.applyAutofocusMeasurement(runtime,
+			g_scFxBlock->afDistance, g_scFxBlock->afTanHalfHFov,
+			(int)g_scFxBlock->afStatus);
+	}
+}
+
+
+// One accumulated depth-of-field frame, driven by the renderer instead of by a
+// person clicking through this panel.
+//
+// The panel's own flow is: start a session, dial the focus in by eye, press
+// render, wait, look at the result. Every one of those steps is a human, and
+// that is the only reason a sequence was never possible. Autofocus removed the
+// one that mattered - Setup no longer needs anyone - so the rest is just calling
+// the same three functions in order.
+//
+// The finished image is deliberately LEFT ON SCREEN in the Done state. The
+// renderer then takes an ordinary capture, which is what makes this cost no new
+// file path, buffer or image format anywhere.
+static void sc_fxDofTick(effect_runtime* runtime)
+{
+	if (nullptr == g_scFxBlock || g_scFxBlock->magic != 0x53434658u)
+	{
+		return;
+	}
+
+	enum class Phase { Idle, WaitSetup, WaitRender, Delivered };
+	static Phase    s_phase   = Phase::Idle;
+	static uint32_t s_seenSeq = 0;
+	static uint32_t s_waited  = 0;
+	static bool     s_lensApplied = false;
+	static uint32_t s_afSeqAtStart = 0;
+
+	const uint32_t seq = g_scFxBlock->dofSeq;
+
+	// 0 means the renderer wants no session at all. Also the way it says "the
+	// render is over" and the way it cancels, so one path tears down.
+	if (seq == 0)
+	{
+		if (s_phase != Phase::Idle)
+		{
+			g_depthOfFieldController.endSession(runtime);
+			s_phase = Phase::Idle;
+			g_scFxBlock->dofStatus = 0;
+		}
+		s_seenSeq = 0;
+		return;
+	}
+
+	// A new request. Anything still up belongs to the previous frame - end it,
+	// which is also what releases the image the renderer has by now captured.
+	//
+	// Keyed on the CONTROLLER's state rather than our own phase, so it also
+	// clears a session the user started by hand and left open. Otherwise the
+	// first frame of a render would try to open a second session on top of it,
+	// be refused, and abort the whole render - with the cause being something
+	// the user did several minutes earlier in a different window.
+	if (seq != s_seenSeq)
+	{
+		s_seenSeq = seq;
+		s_waited  = 0;
+		s_lensApplied = false;
+		if (DepthOfFieldControllerState::Off != g_depthOfFieldController.getState())
+		{
+			g_depthOfFieldController.endSession(runtime);
+		}
+		g_depthOfFieldController.setShutterMs(g_scFxBlock->dofShutterMs);
+		g_depthOfFieldController.startSession(runtime);
+		s_phase = (DepthOfFieldControllerState::Setup == g_depthOfFieldController.getState() ||
+		           DepthOfFieldControllerState::Start == g_depthOfFieldController.getState())
+			? Phase::WaitSetup : Phase::Idle;
+		g_scFxBlock->dofStatus = (s_phase == Phase::WaitSetup) ? 1u : 3u;
+		return;
+	}
+
+	switch (s_phase)
+	{
+		case Phase::WaitSetup:
+		{
+			++s_waited;
+			if (DepthOfFieldControllerState::Setup != g_depthOfFieldController.getState())
+			{
+				// Still starting, or it failed outright.
+				if (s_waited > 600)
+				{
+					g_scFxBlock->dofStatus = 3;
+					s_phase = Phase::Idle;
+				}
+				break;
+			}
+
+			// Apply the lens the renderer pushed, now that we are in Setup.
+			//
+			// Here and not at the request, because setMaxBokehSize refuses
+			// outside Setup - it rescales the focus delta as it goes, which is
+			// only meaningful once a session exists. Applied every pass rather
+			// than once, so changing the aperture between renders takes without
+			// anyone having to restart anything.
+			if (!s_lensApplied)
+			{
+				s_lensApplied = true;
+				g_depthOfFieldController.setQuality((int)g_scFxBlock->dofQuality);
+
+				// The renderer's highlight boost, pointed at OUR accumulator.
+				//
+				// It normally applies while the renderer averages its own
+				// captures - which does not happen here, since a pass arrives
+				// already accumulated and is grabbed in one shot. The job is
+				// identical though (keep speculars bright instead of averaging
+				// them down to grey) and so is the range, so the setting is
+				// routed rather than disabled. The GAMMA that goes with it stays
+				// in this panel: it is a curve, and curves are judged by eye.
+				g_depthOfFieldController.setHighlightBoostFactor(g_scFxBlock->highlightBoost);
+				g_depthOfFieldController.setAutofocusEnabled(g_scFxBlock->dofAutofocus != 0);
+				// Applied BEFORE the point, because the point is only meaningful
+				// once autofocus owns the focus - and before maxBokehSize, whose
+				// setter rescales the focus delta the measurement is about to
+				// replace.
+				g_depthOfFieldController.setAutofocusPoint(g_scFxBlock->dofFocusX,
+				                                           g_scFxBlock->dofFocusY);
+				g_depthOfFieldController.setMaxBokehSize(runtime, g_scFxBlock->dofBokehSize);
+
+				// Remember which answer was current, so the wait below can tell a
+				// FRESH measurement from the one this frame inherited.
+				s_afSeqAtStart = g_scFxBlock->afResultId;
+
+				// Report what was received, and what the controller made of it.
+				//
+				// setMaxBokehSize refuses outside Setup and clamps inside it, so
+				// "the renderer sent 0.12" and "the lens is 0.12" are different
+				// claims - and only the second one is what gets rendered.
+				char msg[256];
+				snprintf(msg, sizeof(msg),
+					"DoF: renderer set aperture %.3f (lens now %.3f), %u rings, "
+					"autofocus %s at %.2f,%.2f, highlight %.2f",
+					g_scFxBlock->dofBokehSize, g_depthOfFieldController.getMaxBokehSize(),
+					g_scFxBlock->dofQuality,
+					g_scFxBlock->dofAutofocus ? "on" : "off",
+					g_scFxBlock->dofFocusX, g_scFxBlock->dofFocusY,
+					g_scFxBlock->highlightBoost);
+				reshade::log::message(reshade::log::level::info, msg);
+			}
+
+			// Give autofocus a measurement before committing the frame. Without
+			// this the first frame of a render focuses on whatever the last
+			// session left behind, which is usually the wrong subject and always
+			// the wrong distance.
+			const bool wantAf = g_depthOfFieldController.getAutofocusEnabled();
+
+			// Wait for an answer newer than this pass, not for a good status.
+			//
+			// Status is sticky - it keeps the last pass's value - so testing it
+			// let every frame after the first commit immediately on the PREVIOUS
+			// frame's focus. On a static shot that is invisible; on a moving one
+			// focus trails the subject by a frame forever.
+			//
+			// Keyed on the answer counter rather than the status so a measurement
+			// that finds nothing still counts as an answer. The controller holds
+			// its last good focus in that case, which is the right response to a
+			// focus point that briefly crosses the sky - far better than waiting
+			// out the timeout on every frame of a render.
+			const bool afSettled = !wantAf || (g_scFxBlock->afResultId != s_afSeqAtStart);
+
+			// Trace the Setup phase for the first few passes of a render.
+			//
+			// This is where focus is decided, and a pass that commits before the
+			// measurement lands renders with whatever the previous session left
+			// behind - which looks exactly like autofocus not working at all.
+			// Only the first passes, so a long render is not flooded.
+			{
+				static int traced = 0;
+				if (traced < 12)
+				{
+					++traced;
+					char m[224];
+					snprintf(m, sizeof(m),
+						"DoF setup: waited %u, afWanted %d, afStatus %d, delta %.5f, "
+						"dist %.2f -> %s",
+						s_waited, wantAf ? 1 : 0,
+						g_depthOfFieldController.getAutofocusStatus(),
+						g_depthOfFieldController.getXFocusDelta(),
+						g_depthOfFieldController.getAutofocusDistance(),
+						((afSettled && s_waited >= 3) || s_waited > 600) ? "COMMIT" : "wait");
+					reshade::log::message(reshade::log::level::info, m);
+				}
+			}
+
+			if ((afSettled && s_waited >= 3) || s_waited > 600)
+			{
+				g_depthOfFieldController.startRender(runtime);
+				s_phase = Phase::WaitRender;
+				s_waited = 0;
+			}
+			break;
+		}
+
+		case Phase::WaitRender:
+			if (DepthOfFieldControllerState::Done == g_depthOfFieldController.getState())
+			{
+				// The image is up. Say so and then do nothing - the session is
+				// held open on purpose, because ending it here would clear the
+				// very frame the renderer is about to capture.
+				g_scFxBlock->dofStatus  = 2;
+				g_scFxBlock->dofDoneSeq = s_seenSeq;
+				s_phase = Phase::Delivered;
+			}
+			else if (DepthOfFieldControllerState::Rendering != g_depthOfFieldController.getState())
+			{
+				g_scFxBlock->dofStatus = 3;   // cancelled or fell over
+				s_phase = Phase::Idle;
+			}
+			break;
+
+		default:
+			break;
+	}
+}
+
+
 static void onReshadePresent(effect_runtime* runtime)
 {
 	g_screenshotController.presentCalled();
 
 	// Simple Camera frame-capture requests.
 	sc_fxCaptureTick(runtime);
+	sc_fxAutofocusTick(runtime);
+	sc_fxDofTick(runtime);
 
 	// handle our work.
 	handleWorkQueue(runtime);
@@ -970,25 +1281,88 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 								g_depthOfFieldController.setMaxBokehSize(runtime, maxBokehSize);
 							}
 
+							// Autofocus. The connected tool measures what is actually in
+							// front of the lens and we convert that to a focus delta, so
+							// the two images align on the subject without anyone dragging.
+							bool autofocus = g_depthOfFieldController.getAutofocusEnabled();
+							if(ImGui::Checkbox("Autofocus", &autofocus))
+							{
+								g_depthOfFieldController.setAutofocusEnabled(autofocus);
+							}
+							if(ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+							{
+								ImGui::SetTooltip("Focus on whatever the focus point below is over, measured in the world.\nNeeds a connected tool that supports it; without one this does nothing.\n\nTurning it off leaves the focus where it was, so you can fine-tune by hand.");
+							}
+
+							if(autofocus)
+							{
+								float afPoint[2] = { g_depthOfFieldController.getAutofocusPointX(),
+								                     g_depthOfFieldController.getAutofocusPointY() };
+								if(ImGui::DragFloat2("Focus point", afPoint, 0.002f, 0.0f, 1.0f, "%.3f"))
+								{
+									g_depthOfFieldController.setAutofocusPoint(afPoint[0], afPoint[1]);
+								}
+								if(ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+								{
+									ImGui::SetTooltip("Where in the frame to focus. 0,0 is the top left, 1,1 the bottom right,\nso 0.5, 0.5 is the centre.\n\nPut it on the part you want sharp - on a face rather than the middle\nof a body, or the plane lands somewhere behind the eyes.");
+								}
+
+								switch(g_depthOfFieldController.getAutofocusStatus())
+								{
+									case 0:
+										ImGui::Text("Focused at %.2f m", g_depthOfFieldController.getAutofocusDistance());
+										break;
+									case 1:
+										ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+											"Nothing under the focus point - holding %.2f m",
+											g_depthOfFieldController.getAutofocusDistance());
+										break;
+									default:
+										ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "No tool is measuring");
+										break;
+								}
+							}
+
 							float focusDelta = g_depthOfFieldController.getXFocusDelta();
+							// Read-only while autofocus owns it: dragging would be
+							// overwritten on the next measurement, which reads as the
+							// slider being broken rather than as being driven.
+							ImGui::BeginDisabled(autofocus);
 							changed = ImGui::DragFloat("Focus delta X", &focusDelta, 0.00005f, -1.0f, 1.0f, "%.5f");
+							ImGui::EndDisabled();
 							if(ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
 							{
 								ImGui::SetTooltip("Use this value to align the two images\non the spot you want to have in focus");
 							}
-							if(changed)
+							if(changed && !autofocus)
 							{
 								g_depthOfFieldController.setXFocusDelta(runtime, focusDelta);
 							}
-							int frameWaitType = (int)g_depthOfFieldController.getFrameWaitType();
+							// Fast and the shutter cannot be combined - see
+							// effectiveFrameWaitType. Shown as forced rather than
+							// silently overridden, or the combo would say Fast while
+							// Classic ran and the render time would make no sense.
+							const bool shutterForcesClassic = g_depthOfFieldController.shutterInUse();
+							int frameWaitType = (int)(shutterForcesClassic
+								? DepthOfFieldFrameWaitType::Classic
+								: g_depthOfFieldController.getFrameWaitType());
+
+							ImGui::BeginDisabled(shutterForcesClassic);
 							changed = ImGui::Combo("Frame wait type", &frameWaitType, "Fast\0Classic (slower)\0\0");
+							ImGui::EndDisabled();
 							if(ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
 							{
 								ImGui::SetTooltip("Fast is using a system which renders at full frame rate.\nYou need to pick the number of frames to wait value that gives a sharp focus area.\n\nClassic is slower, it uses the number of frames to wait to delay the next frame\nso the higher the value, the slower the rendering. Classic is more reliable to have sharp focus areas.");
 							}
-							if(changed)
+							if(changed && !shutterForcesClassic)
 							{
 								g_depthOfFieldController.setFrameWaitType((DepthOfFieldFrameWaitType)frameWaitType);
+							}
+							if(shutterForcesClassic)
+							{
+								ImGui::TextWrapped("Classic is required while the shutter is above 0: each sample is a "
+								                   "different moment in time, and Fast grabs the frame before the game "
+								                   "has moved to it, which smears the result instead of blurring it.");
 							}
 							std::string toolTipText = "";
 							switch(frameWaitType)

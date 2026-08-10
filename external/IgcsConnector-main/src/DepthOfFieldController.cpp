@@ -86,6 +86,48 @@ void DepthOfFieldController::setXFocusDelta(reshade::api::effect_runtime* runtim
 }
 
 
+// Which way the setup camera displaces relative to a positive FocusDelta.
+//
+// Not derivable from either side: it falls out of the controller's own move
+// direction combined with the shader's `uv - float2(FocusDelta, 0)`. Measured
+// once against a known distance and then constant - if autofocus focuses behind
+// the subject by as much as it should have focused in front, this is the flip.
+static constexpr float kAutofocusSign = 1.0f;
+
+void DepthOfFieldController::applyAutofocusMeasurement(reshade::api::effect_runtime* runtime, float distance,
+                                                       float tanHalfHFov, int status)
+{
+	_autofocusStatus = status;
+
+	if(DepthOfFieldControllerState::Setup != _state || !_autofocusEnabled)
+	{
+		// Same guard as setXFocusDelta: focus is only meaningful while the setup
+		// pass is the thing on screen.
+		return;
+	}
+	if(status != 0 || distance <= 0.01f || tanHalfHFov <= 0.0001f)
+	{
+		// Nothing was hit, or the frame had no usable lens angle. Hold the last
+		// good focus rather than snapping to infinity - a miss is usually the
+		// focus point briefly crossing the sky, and a lurch to zero disparity
+		// would be far more visible than staying put.
+		return;
+	}
+
+	_autofocusDistance = distance;
+
+	const float newDelta = kAutofocusSign * (_maxBokehSize / (2.0f * distance * tanHalfHFov));
+	if(newDelta == _focusDelta)
+	{
+		return;
+	}
+	_focusDelta = newDelta;
+
+	calculateShapePoints();
+	setUniformFloatVariable(runtime, "FocusDelta", _focusDelta);
+}
+
+
 void DepthOfFieldController::displayScreenshotSessionStartError(const ScreenshotSessionStartReturnCode sessionStartResult)
 {
 	std::string reason = "Unknown error.";
@@ -163,6 +205,17 @@ void DepthOfFieldController::loadIniFileData(CDataFile& iniFile)
 	loadIntFromIni(iniFile, "NumberOfFramesToWaitPerFrame", &_numberOfFramesToWait);
 	loadBoolFromIni(iniFile, "ShowProgressBarAsOverlay", &_showProgressBarAsOverlay, true);
 	loadBoolFromIni(iniFile, "AddCatEyeVignette", &_addCatEyeVignette, false);
+
+	// Autofocus and its point persist like every other setting here.
+	//
+	// They did not, which meant the checkbox was off at every launch and a
+	// render driven by a connected tool relied entirely on that tool pushing it
+	// - so ticking it by hand once, in a throwaway session, was the difference
+	// between focus working and not. That is not a state anyone should have to
+	// discover.
+	loadBoolFromIni(iniFile, "Autofocus", &_autofocusEnabled, false);
+	loadFloatFromIni(iniFile, "AutofocusPointX", &_autofocusPointX);
+	loadFloatFromIni(iniFile, "AutofocusPointY", &_autofocusPointY);
 	loadFloatFromIni(iniFile, "CatEyeRadiusStart", &_catEyeRadiusStart);
 	loadFloatFromIni(iniFile, "CatEyeRadiusEnd", &_catEyeRadiusEnd);
 	loadFloatFromIni(iniFile, "CatEyeBokehIntensity", &_catEyeBokehIntensity);
@@ -178,6 +231,9 @@ void DepthOfFieldController::loadIniFileData(CDataFile& iniFile)
 void DepthOfFieldController::saveIniFileData(CDataFile& iniFile)
 {
 	iniFile.SetFloat("MaxBokehSize", _maxBokehSize, "", "DepthOfField");
+	iniFile.SetBool("Autofocus", _autofocusEnabled, "", "DepthOfField");
+	iniFile.SetFloat("AutofocusPointX", _autofocusPointX, "", "DepthOfField");
+	iniFile.SetFloat("AutofocusPointY", _autofocusPointY, "", "DepthOfField");
 	iniFile.SetFloat("ShutterMs", _shutterMs, "", "DepthOfField");
 	iniFile.SetFloat("HighlightBoostFactor", _highlightBoostFactor, "", "DepthOfField");
 	iniFile.SetFloat("HighlightGammaFactor", _highlightGammaFactor, "", "DepthOfField");
@@ -325,7 +381,7 @@ void DepthOfFieldController::performRenderFrameSetupWork()
 		const auto& currentBlendFrameData = _cameraSteps[_currentBlendFrame];
 		_xAlignmentDelta = currentBlendFrameData.xAlignmentDelta;
 		_yAlignmentDelta = currentBlendFrameData.yAlignmentDelta;
-		switch(_frameWaitType)
+		switch(effectiveFrameWaitType())
 		{
 			case DepthOfFieldFrameWaitType::Fast:
 				_frameWaitCounter = 0;
@@ -834,7 +890,7 @@ void DepthOfFieldController::startRender(reshade::api::effect_runtime* runtime)
 	// Never inherit a wait from a session that was cancelled mid-step.
 	_awaitingSampleReady = false;
 	_sampleReadyWaitCounter = 0;
-	switch(_frameWaitType)
+	switch(effectiveFrameWaitType())
 	{
 		case DepthOfFieldFrameWaitType::Classic:
 			_currentBlendFrame = 0;
@@ -930,6 +986,55 @@ void DepthOfFieldController::renderProgressBar()
 
 void DepthOfFieldController::renderOverlay()
 {
+	// Where autofocus is aiming.
+	//
+	// Two numbers in a panel are not a focus point - you cannot put one on a
+	// face without seeing where it lands, and the whole reason the point is
+	// adjustable is that the middle of the frame is rarely the subject. Drawn on
+	// the foreground list so it sits over the game rather than inside a window,
+	// and only during setup, which is the only time it means anything.
+	if(DepthOfFieldControllerState::Setup == _state && _autofocusEnabled)
+	{
+		const ImVec2 screen = ImGui::GetIO().DisplaySize;
+		const float cx = _autofocusPointX * screen.x;
+		const float cy = _autofocusPointY * screen.y;
+
+		ImDrawList* fg = ImGui::GetForegroundDrawList();
+
+		// Amber when there is nothing to focus on, so a point hanging over the
+		// sky reads differently from one that is working.
+		const ImU32 col = (_autofocusStatus == 0) ? IM_COL32(255, 255, 255, 220)
+		                                          : IM_COL32(255, 178, 51, 230);
+		const ImU32 shadow = IM_COL32(0, 0, 0, 160);
+
+		const float gap = 5.0f;    // left open in the middle - a solid cross hides
+		const float arm = 13.0f;   // the very thing you are trying to aim at
+		const float r   = 16.0f;
+
+		// Drawn twice, black first and one pixel down, or the mark disappears
+		// over anything pale - which outdoors is most of the frame.
+		for(int pass = 0; pass < 2; ++pass)
+		{
+			const ImU32 c = (pass == 0) ? shadow : col;
+			const float o = (pass == 0) ? 1.0f : 0.0f;
+			const float t = (pass == 0) ? 2.5f : 1.5f;
+
+			fg->AddLine(ImVec2(cx - arm + o, cy + o), ImVec2(cx - gap + o, cy + o), c, t);
+			fg->AddLine(ImVec2(cx + gap + o, cy + o), ImVec2(cx + arm + o, cy + o), c, t);
+			fg->AddLine(ImVec2(cx + o, cy - arm + o), ImVec2(cx + o, cy - gap + o), c, t);
+			fg->AddLine(ImVec2(cx + o, cy + gap + o), ImVec2(cx + o, cy + arm + o), c, t);
+			fg->AddCircle(ImVec2(cx + o, cy + o), r, c, 0, t);
+		}
+
+		if(_autofocusStatus == 0 && _autofocusDistance > 0.0f)
+		{
+			char buf[32];
+			snprintf(buf, sizeof(buf), "%.2f m", _autofocusDistance);
+			fg->AddText(ImVec2(cx + r + 5.0f + 1.0f, cy - 6.0f + 1.0f), shadow, buf);
+			fg->AddText(ImVec2(cx + r + 5.0f, cy - 6.0f), col, buf);
+		}
+	}
+
 	if(_state!=DepthOfFieldControllerState::Rendering || _cameraSteps.size()<=0 || !_showProgressBarAsOverlay)
 	{
 		return;

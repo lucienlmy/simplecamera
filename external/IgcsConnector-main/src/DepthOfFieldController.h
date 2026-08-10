@@ -252,8 +252,59 @@ public:
 	/// shutter is something the UI should offer at all.
 	/// </summary>
 	bool supportsShutter() { return _cameraToolsConnector.supportsTimedMultishot(); }
+
+	/// <summary>
+	/// True while the shutter is actually doing something.
+	/// </summary>
+	bool shutterInUse() { return supportsShutter() && _shutterMs > 0.0f; }
+
+	/// <summary>
+	/// The frame wait actually used, which is not always the one that was picked.
+	///
+	/// Fast waits zero frames between samples. That is fine when every sample is
+	/// the same INSTANT seen from a different point on the aperture, because
+	/// nothing on screen has to change between them. The shutter makes each
+	/// sample a different TIME as well, and the game needs a frame or two to
+	/// actually land on it - so grabbing immediately captures a frame the seek
+	/// has not reached yet. The result is not sharp-with-motion-blur, it is
+	/// smeared, and it looks like the depth of field itself is broken.
+	///
+	/// So the shutter forces Classic rather than offering a combination that
+	/// cannot work. The user's own choice is remembered for when the shutter
+	/// goes back to zero.
+	/// </summary>
+	DepthOfFieldFrameWaitType effectiveFrameWaitType()
+	{
+		return shutterInUse() ? DepthOfFieldFrameWaitType::Classic : _frameWaitType;
+	}
 	float getMaxBokehSize() { return _maxBokehSize; }
 	float getXFocusDelta() { return _focusDelta; }
+
+	// --- autofocus ---------------------------------------------------------
+	// The ASI measures the world; we own the lens. See applyAutofocusMeasurement.
+	bool  getAutofocusEnabled() { return _autofocusEnabled; }
+	void  setAutofocusEnabled(bool v) { _autofocusEnabled = v; }
+	float getAutofocusPointX() { return _autofocusPointX; }
+	float getAutofocusPointY() { return _autofocusPointY; }
+	void  setAutofocusPoint(float x, float y) { _autofocusPointX = x; _autofocusPointY = y; }
+	float getAutofocusDistance() { return _autofocusDistance; }
+	int   getAutofocusStatus() { return _autofocusStatus; }
+
+	/// <summary>
+	/// Convert a measured distance into our own focus units and apply it.
+	///
+	/// distance is metres to the subject ALONG THE VIEW AXIS and tanHalfHFov is
+	/// the half-angle of the frame's horizontal field of view - both from the
+	/// side that can see the world. FocusDelta is not a distance: it is the
+	/// horizontal UV disparity between a view taken here and one taken
+	/// maxBokehSize to the side, which is the stereo baseline. So this is
+	/// d = B*f/Z with the focal length expressed in UV, f = 1/(2*tan(hfov/2)).
+	///
+	/// Dragging the slider by hand until the subject stops ghosting is doing
+	/// exactly this by eye; this just does the arithmetic instead.
+	/// </summary>
+	void applyAutofocusMeasurement(reshade::api::effect_runtime* runtime, float distance,
+	                               float tanHalfHFov, int status);
 	int getQuality() { return _quality; }
 	float getHighlightBoostFactor() { return _highlightBoostFactor; }
 	float getHighlightGammaFactor() { return _highlightGammaFactor; }
@@ -360,6 +411,12 @@ private:
 
 	float _maxBokehSize = 0.25;			// value 'B', so the max diameter of a circle we're going to walk. In world units of the engine
 	float _focusDelta = 0.0f;			// value 'A', the relationship between stepping over maxBokehSize and the movement of the pixels that have to be in focus. X specific
+
+	bool  _autofocusEnabled = false;	// drive _focusDelta from a measured distance instead of the slider
+	float _autofocusPointX = 0.5f;		// where in the frame to focus, 0..1 from the left
+	float _autofocusPointY = 0.5f;		// and from the top. Centre by default, but a face is rarely centred
+	float _autofocusDistance = 0.0f;	// last measured distance, metres along the view axis. Display only
+	int   _autofocusStatus = 2;			// 0 ok, 1 nothing hit, 2 no camera / nothing measuring yet
 	bool _blendFrame = false;			// if true, the shader will blend the curreent frame if state is Render
 	float _blendFactor = 0.0f;			// for the shader, the blend factor to use when blending a frame
 	float _xAlignmentDelta = 0.0f;		// for the shader, the alignment x delta to use
