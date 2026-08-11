@@ -128,6 +128,20 @@ struct SC_FxCaptureBlock
 	// tie is decided by who is rendering rather than by load order.
 	uint32_t asiModuleLo;   // ASI -> us: HMODULE to bind to, 0 = no preference
 	uint32_t asiModuleHi;
+
+	// --- manual focus, per marker (v11) ------------------------------------
+	// Ignored while dofAutofocus is 1. In OUR disparity units - the number the
+	// Focus Delta slider shows - not metres, so the ASI never needs to know
+	// maxBokehSize or the frame's fov.
+	float    dofFocusDelta;
+
+	// --- what the lens is doing RIGHT NOW (v12) ----------------------------
+	// Published every present so a camera tool can capture the focus a user just
+	// dialled by eye. The aperture goes with it because FocusDelta is a
+	// DISPARITY, not a distance - it scales with maxBokehSize, so a delta
+	// without the aperture it was measured at means nothing.
+	float    dofLiveFocusDelta;
+	float    dofLiveBokeh;
 };
 #pragma pack(pop)
 
@@ -806,6 +820,17 @@ bool requiredTechniqueEnabled(const std::string& effectName, const std::string& 
 
 static void sc_fxDofTick(effect_runtime* runtime)
 {
+	// The live lens, for a tool that wants to capture the focus a user just
+	// dialled by eye. Published here rather than beside the heartbeat because
+	// that runs above g_depthOfFieldController's definition and cannot see it.
+	// Unconditional, so the value is valid the instant a session ENDS rather
+	// than only while one is running - which is exactly when a capture happens.
+	if (g_scFxBlock)
+	{
+		g_scFxBlock->dofLiveFocusDelta = g_depthOfFieldController.getXFocusDelta();
+		g_scFxBlock->dofLiveBokeh      = g_depthOfFieldController.getMaxBokehSize();
+	}
+
 	if (nullptr == g_scFxBlock || g_scFxBlock->magic != 0x53434658u)
 	{
 		return;
@@ -950,6 +975,16 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				                                           g_scFxBlock->dofFocusY);
 				g_depthOfFieldController.setMaxBokehSize(runtime, g_scFxBlock->dofBokehSize);
 
+				// Manual focus, when autofocus is not driving it.
+				//
+				// AFTER setMaxBokehSize, deliberately: that setter rescales the focus
+				// delta so the focal plane survives an aperture change, and a value
+				// applied before it would be moved by exactly that rescale.
+				if (g_scFxBlock->dofAutofocus == 0)
+				{
+					g_depthOfFieldController.setXFocusDelta(runtime, g_scFxBlock->dofFocusDelta);
+				}
+
 				// Remember which answer was current, so the wait below can tell a
 				// FRESH measurement from the one this frame inherited.
 				s_afSeqAtStart = g_scFxBlock->afResultId;
@@ -962,11 +997,12 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				char msg[256];
 				snprintf(msg, sizeof(msg),
 					"DoF: renderer set aperture %.3f (lens now %.3f), %u rings, "
-					"autofocus %s at %.2f,%.2f, highlight %.2f",
+					"autofocus %s at %.2f,%.2f, focus %.5f, highlight %.2f",
 					g_scFxBlock->dofBokehSize, g_depthOfFieldController.getMaxBokehSize(),
 					g_scFxBlock->dofQuality,
 					g_scFxBlock->dofAutofocus ? "on" : "off",
 					g_scFxBlock->dofFocusX, g_scFxBlock->dofFocusY,
+					g_depthOfFieldController.getXFocusDelta(),
 					g_scFxBlock->highlightBoost);
 				reshade::log::message(reshade::log::level::info, msg);
 			}

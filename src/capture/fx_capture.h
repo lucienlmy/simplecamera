@@ -20,7 +20,7 @@
 #pragma pack(push, 4)
 struct FxCaptureBlock {
   uint32_t magic;       // 'SCFX' (0x53434658) — set by the ASI once mapped
-  uint32_t version;     // 6
+  uint32_t version;     // 12
   uint32_t requestId;   // ASI increments to request a capture
   uint32_t ackId;       // addon echoes requestId once handled
   uint32_t status;      // 0 = ok, 1 = capture failed, 2 = file write failed
@@ -70,6 +70,19 @@ struct FxCaptureBlock {
   // --- which camera tool owns the interface (v10) ------------------------
   uint32_t asiModuleLo;
   uint32_t asiModuleHi;
+
+  // --- manual focus (v11) -----------------------------------------------
+  // Not used by Simple Camera - carried so this struct stays byte-identical
+  // to the add-on's copy and RockstarEditorPlus's. Do not reorder or drop.
+  float    dofFocusDelta;
+
+  // --- what the lens is doing RIGHT NOW (v12) ----------------------------
+  // Published every present so a camera tool can capture the focus a user just
+  // dialled by eye. The aperture goes with it because FocusDelta is a
+  // DISPARITY, not a distance - it scales with maxBokehSize, so a delta
+  // without the aperture it was measured at means nothing.
+  float    dofLiveFocusDelta;
+  float    dofLiveBokeh;
 };
 #pragma pack(pop)
 
