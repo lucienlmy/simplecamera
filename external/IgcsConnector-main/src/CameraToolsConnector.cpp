@@ -33,11 +33,50 @@
 #include "stdafx.h"
 #include "CameraToolsConnector.h"
 #include "OverlayControl.h"
+#include <cstring>
+#include <cstdio>
+
+
+namespace
+{
+	// Tools that export the IGCS interface as a SIDE FEATURE.
+	//
+	// Not a blacklist - a tie-break. Several mods export these entry points, and
+	// the scan below used to take whichever the loader happened to place first.
+	// When that landed on one of these, a depth-of-field session drove ITS
+	// camera while a different tool was asking for the frames: sessions started,
+	// passes completed, and every frame came out identical because the camera
+	// never moved where the accumulator thought it had. Nothing reported an
+	// error, because every step that gets checked did work.
+	//
+	// So one of these is used only when it is the ONLY tool present, which keeps
+	// it working exactly as before for anyone running it on its own.
+	bool isSecondaryCameraTool(HMODULE moduleHandle)
+	{
+		char path[MAX_PATH]{};
+		if(0 == GetModuleFileNameA(moduleHandle, path, MAX_PATH))
+		{
+			return false;
+		}
+		const char* name = strrchr(path, '\\');
+		name = name ? name + 1 : path;
+
+		static const char* const secondary[] = { "NVE.asi" };
+		for(const char* s : secondary)
+		{
+			if(0 == _stricmp(name, s))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+}
 
 
 void CameraToolsConnector::connectToCameraTools()
 {
-	// Enumerate all modules in the process and check if they export a defined function (IGCS_StartScreenshotSession). If so, we map to the known functions. 
+	// Enumerate all modules in the process and check if they export a defined function (IGCS_StartScreenshotSession). If so, we map to the known functions.
 	const HANDLE processHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, GetCurrentProcessId());
 	if(nullptr == processHandle)
 	{
@@ -47,28 +86,65 @@ void CameraToolsConnector::connectToCameraTools()
 	DWORD cbNeeded;
 	if(EnumProcessModules(processHandle, modules, sizeof(modules), &cbNeeded))
 	{
+		// Two passes rather than first-past-the-post - see isSecondaryCameraTool.
+		HMODULE preferred = nullptr;
+		HMODULE fallback  = nullptr;
+
 		for(int i = 0; i < cbNeeded / sizeof(HMODULE); i++)
 		{
-			// check if this module exports the IGCS_StartScreenshotSession function.
 			const HMODULE moduleHandle = modules[i];
-			_igcs_StartScreenshotSessionFunc = (IGCS_StartScreenshotSession)GetProcAddress(moduleHandle, "IGCS_StartScreenshotSession");
-			if(nullptr == _igcs_StartScreenshotSessionFunc)
+			if(nullptr == GetProcAddress(moduleHandle, "IGCS_StartScreenshotSession"))
 			{
 				// doesn't export it, not an IGCS camera tools dll
 				continue;
 			}
-			// map the other functions
-			_igcs_EndScreenshotSessionFunc = (IGCS_EndScreenshotSession)GetProcAddress(moduleHandle, "IGCS_EndScreenshotSession");
-			_igcs_MoveCameraPanoramaFunc = (IGCS_MoveCameraPanorama)GetProcAddress(moduleHandle, "IGCS_MoveCameraPanorama");
-			_igcs_MoveCameraMultishotFunc = (IGCS_MoveCameraMultishot)GetProcAddress(moduleHandle, "IGCS_MoveCameraMultishot");
-			// Optional extensions - absent on tools that predate them.
-			_igcs_MoveCameraMultishotTimedFunc = (IGCS_MoveCameraMultishotTimed)GetProcAddress(moduleHandle, "IGCS_MoveCameraMultishotTimed");
-			_igcs_QuerySampleReadyFunc = (IGCS_QuerySampleReady)GetProcAddress(moduleHandle, "IGCS_QuerySampleReady");
-			break;
+			if(isSecondaryCameraTool(moduleHandle))
+			{
+				if(nullptr == fallback) fallback = moduleHandle;
+				continue;
+			}
+			if(nullptr == preferred) preferred = moduleHandle;
+		}
+
+		const HMODULE chosen = preferred ? preferred : fallback;
+		if(nullptr != chosen)
+		{
+			connectToModule(chosen);
+
+			// Said out loud, because "which tool is driving" is invisible
+			// otherwise and is exactly what goes wrong in a modded game.
+			char path[MAX_PATH]{};
+			GetModuleFileNameA(chosen, path, MAX_PATH);
+			char msg[MAX_PATH + 96];
+			snprintf(msg, sizeof(msg), "Camera tools bound to %s%s", path,
+				(preferred && fallback) ? " (another tool also offers the interface)" : "");
+			OverlayControl::addNotification(msg);
 		}
 	}
 	CloseHandle(processHandle);
 	OverlayControl::addNotification(cameraToolsConnected() ? "Camera tools connected" : "No camera tools found");
+}
+
+
+bool CameraToolsConnector::connectToModule(HMODULE moduleHandle)
+{
+	if(nullptr == moduleHandle)
+	{
+		return false;
+	}
+	const auto start = (IGCS_StartScreenshotSession)GetProcAddress(moduleHandle, "IGCS_StartScreenshotSession");
+	if(nullptr == start)
+	{
+		return false;
+	}
+
+	_igcs_StartScreenshotSessionFunc   = start;
+	_igcs_EndScreenshotSessionFunc     = (IGCS_EndScreenshotSession)GetProcAddress(moduleHandle, "IGCS_EndScreenshotSession");
+	_igcs_MoveCameraPanoramaFunc       = (IGCS_MoveCameraPanorama)GetProcAddress(moduleHandle, "IGCS_MoveCameraPanorama");
+	_igcs_MoveCameraMultishotFunc      = (IGCS_MoveCameraMultishot)GetProcAddress(moduleHandle, "IGCS_MoveCameraMultishot");
+	_igcs_MoveCameraMultishotTimedFunc = (IGCS_MoveCameraMultishotTimed)GetProcAddress(moduleHandle, "IGCS_MoveCameraMultishotTimed");
+	_igcs_QuerySampleReadyFunc         = (IGCS_QuerySampleReady)GetProcAddress(moduleHandle, "IGCS_QuerySampleReady");
+	return true;
 }
 
 

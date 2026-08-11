@@ -111,6 +111,16 @@ public:
 	///	so other addins can also communicate with the camera tools without a required call from the camera tools. 
 	/// </summary>
 	void connectToCameraTools();
+
+	/// <summary>
+	/// Bind to a SPECIFIC module's IGCS exports.
+	///
+	/// connectToCameraTools takes the first loaded module that exports the
+	/// interface, and in a modded game that is a coin toss - NVE exports it too.
+	/// The tool that is driving a render says which one it is; this obeys that.
+	/// Returns false and changes nothing if the module does not export it.
+	/// </summary>
+	bool connectToModule(HMODULE moduleHandle);
 	/// <summary>
 	/// Starts a screenshot session of the specified type
 	/// </summary>

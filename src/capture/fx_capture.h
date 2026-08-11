@@ -66,6 +66,10 @@ struct FxCaptureBlock {
   uint32_t dofAutofocus;
   float    dofFocusX;
   float    dofFocusY;
+
+  // --- which camera tool owns the interface (v10) ------------------------
+  uint32_t asiModuleLo;
+  uint32_t asiModuleHi;
 };
 #pragma pack(pop)
 

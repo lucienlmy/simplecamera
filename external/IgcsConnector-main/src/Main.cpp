@@ -121,6 +121,13 @@ struct SC_FxCaptureBlock
 	uint32_t dofAutofocus;  // 1 = measure focus in the world each frame
 	float    dofFocusX;     // where to measure, 0..1 across
 	float    dofFocusY;     // and down
+
+	// --- which camera tool owns the interface (v10) ------------------------
+	// We bind to the first module exporting the IGCS entry points, and more than
+	// one mod exports them. The ASI driving a render names itself here so the
+	// tie is decided by who is rendering rather than by load order.
+	uint32_t asiModuleLo;   // ASI -> us: HMODULE to bind to, 0 = no preference
+	uint32_t asiModuleHi;
 };
 #pragma pack(pop)
 
@@ -795,6 +802,8 @@ static void sc_fxAutofocusTick(effect_runtime* runtime)
 // The finished image is deliberately LEFT ON SCREEN in the Done state. The
 // renderer then takes an ordinary capture, which is what makes this cost no new
 // file path, buffer or image format anywhere.
+bool requiredTechniqueEnabled(const std::string& effectName, const std::string& techniqueName, effect_runtime* runtime);
+
 static void sc_fxDofTick(effect_runtime* runtime)
 {
 	if (nullptr == g_scFxBlock || g_scFxBlock->magic != 0x53434658u)
@@ -842,6 +851,49 @@ static void sc_fxDofTick(effect_runtime* runtime)
 		{
 			g_depthOfFieldController.endSession(runtime);
 		}
+		// Bind to the tool that is actually driving this render.
+		//
+		// We normally take the first loaded module exporting the IGCS entry
+		// points, and in a modded game that is decided by load order - NVE
+		// exports them too, so a session could end up driving ITS camera while
+		// RockstarEditorPlus is the one asking for frames. Nothing downstream
+		// notices: the session starts, the passes complete, and every frame is
+		// identical because the camera never moved where we thought it did.
+		//
+		// The renderer names its own module in the block, so obey that while it
+		// is driving. Only for render-driven passes; a session someone starts
+		// from this panel keeps whatever the scan found.
+		{
+			const uint64_t h = ((uint64_t)g_scFxBlock->asiModuleHi << 32) |
+			                    (uint64_t)g_scFxBlock->asiModuleLo;
+			if (h != 0 && !g_cameraToolsConnector.connectToModule((HMODULE)h))
+			{
+				reshade::log::message(reshade::log::level::warning,
+					"DoF: the renderer named a module that does not export the IGCS "
+					"interface - staying with whatever was found by scanning.");
+			}
+		}
+
+		// The shader has to be ON, and this is the only place that checks.
+		//
+		// The panel's own "Start depth-of-field session" button is gated on it
+		// and says so; the render path called startSession directly and did not.
+		// IgcsDof.fx IS the accumulation - the add-on only moves the camera and
+		// writes uniforms into it - so without the technique enabled a render
+		// completes normally and produces plain frames with no depth of field in
+		// them at all. Nothing else in the chain notices, because every step it
+		// checks did work.
+		if (!requiredTechniqueEnabled("IgcsDof.fx", "IgcsDOF", runtime))
+		{
+			reshade::log::message(reshade::log::level::error,
+				"DoF: the IgcsDOF technique is not enabled, so nothing would accumulate "
+				"and the render would produce plain frames. Enable 'IgcsDOF' on ReShade's "
+				"Home tab and drag it to the bottom of the list, then render again.");
+			g_scFxBlock->dofStatus = 3;
+			s_phase = Phase::Idle;
+			return;
+		}
+
 		g_depthOfFieldController.setShutterMs(g_scFxBlock->dofShutterMs);
 		g_depthOfFieldController.startSession(runtime);
 		s_phase = (DepthOfFieldControllerState::Setup == g_depthOfFieldController.getState() ||
