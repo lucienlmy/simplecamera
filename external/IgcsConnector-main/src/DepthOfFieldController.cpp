@@ -817,6 +817,19 @@ void DepthOfFieldController::assignSampleTimes()
 	// would work equally well for this but it is not ours to do: the render
 	// order is the user's setting, and a session set to inner-to-outer must
 	// still walk the aperture in that order.
+	// Time is not ours this pass. Zero every fraction so the timed move
+	// degenerates to the plain one, and let applyRenderOrder scramble the
+	// POINTS instead - the decorrelation this shuffle exists for still
+	// happens, just on the other axis.
+	if(_externalTime)
+	{
+		for(size_t i = 0; i < n; i++)
+		{
+			_cameraSteps[i].timeFraction = 0.0f;
+		}
+		return;
+	}
+
 	std::vector<float> fractions(n);
 	for(size_t i = 0; i < n; i++)
 	{
@@ -833,6 +846,16 @@ void DepthOfFieldController::assignSampleTimes()
 
 void DepthOfFieldController::applyRenderOrder()
 {
+	// Overrides the user's choice, and only while a camera tool owns the clock.
+	// Render order is a preview nicety - nobody watches the sweep order during
+	// a render - and here it is the only thing keeping bokeh radius from
+	// tracking time.
+	if(_externalTime)
+	{
+		std::ranges::shuffle(_cameraSteps, std::mt19937(std::random_device()()));
+		return;
+	}
+
 	switch(_renderOrder)
 	{
 		case DepthOfFieldRenderOrder::InnerRingToOuterRing:

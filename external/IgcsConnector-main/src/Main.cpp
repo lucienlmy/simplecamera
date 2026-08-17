@@ -142,6 +142,39 @@ struct SC_FxCaptureBlock
 	// without the aperture it was measured at means nothing.
 	float    dofLiveFocusDelta;
 	float    dofLiveBokeh;
+
+	// --- who owns the clock (v13) ------------------------------------------
+	//
+	// 1 = the ASI is stepping the replay itself between aperture samples, so the
+	// add-on must NOT offset time as well - doing both doubles the exposure. It
+	// shuffles the aperture POINTS instead of the sample times to keep bokeh
+	// radius from tracking time.
+	uint32_t dofExternalTime;
+
+	// addon -> ASI: how many aperture samples this pass will take. The ASI needs
+	// it to size its own time step - shutter divided by this - and it cannot
+	// derive it, because the count follows from the ring geometry we own.
+	uint32_t dofSampleTotal;
+
+	// addon -> ASI: which aperture sample is being taken, 0-based, bumped as
+	// each one lands.
+	//
+	// The ASI steps the clock off CHANGES to this, not off presents. The add-on
+	// takes several presents per sample - its own frame wait - so stepping per
+	// present over-advanced the clip by exactly that ratio, measured at 4x.
+	uint32_t dofSampleIndex;
+
+	// --- copy the session's focus onto the marker (v15) ---------------------
+	//
+	// addon -> ASI: bumped by "Copy to keyframe" in the depth-of-field panel.
+	// The ASI edge-detects a change and writes dofLiveFocusDelta onto the marker
+	// the editor is sitting on, converting from the session's own aperture to the
+	// render aperture first - the delta is a disparity, so the raw number means a
+	// different plane at a different bokeh size.
+	//
+	// A COUNTER, not a flag: a second press is never swallowed, and neither side
+	// has to clear a write the other one made.
+	uint32_t dofCopyRequest;
 };
 #pragma pack(pop)
 
@@ -829,6 +862,8 @@ static void sc_fxDofTick(effect_runtime* runtime)
 	{
 		g_scFxBlock->dofLiveFocusDelta = g_depthOfFieldController.getXFocusDelta();
 		g_scFxBlock->dofLiveBokeh      = g_depthOfFieldController.getMaxBokehSize();
+		g_scFxBlock->dofSampleIndex    =
+			(uint32_t)g_depthOfFieldController.getSampleIndex();
 	}
 
 	if (nullptr == g_scFxBlock || g_scFxBlock->magic != 0x53434658u)
@@ -966,7 +1001,10 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				// routed rather than disabled. The GAMMA that goes with it stays
 				// in this panel: it is a curve, and curves are judged by eye.
 				g_depthOfFieldController.setHighlightBoostFactor(g_scFxBlock->highlightBoost);
-				g_depthOfFieldController.setAutofocusEnabled(g_scFxBlock->dofAutofocus != 0);
+				// BEFORE the geometry is built (setMaxBokehSize rebuilds the point set),
+				// because it decides whether the times or the points get shuffled.
+				g_depthOfFieldController.setExternalTime(g_scFxBlock->dofExternalTime != 0);
+								g_depthOfFieldController.setAutofocusEnabled(g_scFxBlock->dofAutofocus != 0);
 				// Applied BEFORE the point, because the point is only meaningful
 				// once autofocus owns the focus - and before maxBokehSize, whose
 				// setter rescales the focus delta the measurement is about to
@@ -974,6 +1012,12 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				g_depthOfFieldController.setAutofocusPoint(g_scFxBlock->dofFocusX,
 				                                           g_scFxBlock->dofFocusY);
 				g_depthOfFieldController.setMaxBokehSize(runtime, g_scFxBlock->dofBokehSize);
+
+				// Published once the geometry is settled: the caller sizes its own time
+				// step off this, and cannot work it out itself because the count falls
+				// out of ring geometry that lives here.
+				g_scFxBlock->dofSampleTotal =
+					(uint32_t)g_depthOfFieldController.getSampleCount();
 
 				// Manual focus, when autofocus is not driving it.
 				//
@@ -1425,6 +1469,29 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 							if(changed && !autofocus)
 							{
 								g_depthOfFieldController.setXFocusDelta(runtime, focusDelta);
+							}
+
+							// Hand the focus straight to the camera tool's current keyframe.
+							//
+							// Focusing by eye here and then typing the number into the tool was the
+							// whole workflow, and it needed the two apertures to match by hand or the
+							// value landed on a different plane - FocusDelta is a disparity, not a
+							// distance. The tool converts; this only has to ask.
+							//
+							// A counter, not a flag: the tool edge-detects it, so a second press is
+							// never swallowed and neither side clears the other's write.
+							if(g_scFxBlock != nullptr)
+							{
+								if(ImGui::Button("Copy to keyframe"))
+								{
+									g_scFxBlock->dofCopyRequest++;
+								}
+								if(ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+								{
+									ImGui::SetTooltip("Write this focus onto the marker the video editor\n"
+									"is currently on, converted to its render aperture,\n"
+									"and switch that marker to manual focus.");
+								}
 							}
 							// Fast and the shutter cannot be combined - see
 							// effectiveFrameWaitType. Shown as forced rather than

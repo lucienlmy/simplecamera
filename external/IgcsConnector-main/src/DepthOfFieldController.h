@@ -233,6 +233,24 @@ public:
 
 	// getters
 	DepthOfFieldRenderOrder getRenderOrder() { return _renderOrder; }
+
+	// Someone else owns the clock.
+	//
+	// A camera tool stepping the replay itself gives every sample a different
+	// instant already, so we must not ALSO offset time - doing both would
+	// double the exposure. We keep the aperture and give up the time axis.
+	//
+	// Decorrelation still has to happen, or bokeh radius tracks time and a
+	// moving subject smears radially. Normally we shuffle the FRACTIONS against
+	// a fixed point order; with time rising monotonically outside our control
+	// that is not available, so we shuffle the POINTS instead. Same joint
+	// distribution - see the note in assignSampleTimes, which already said this
+	// would work equally well.
+	void setExternalTime(bool v) { _externalTime = v; }
+	size_t getSampleCount() const { return _cameraSteps.size(); }
+	// Which aperture sample is being taken. A tool driving the clock steps on
+	// CHANGES to this, not per present - we take several presents per sample.
+	size_t getSampleIndex() const { return _currentStepFrame; }
 	/// <summary>
 	/// How much SCENE TIME one accumulation covers, in milliseconds. 0 freezes the clock,
 	/// which is the classic behaviour: every sample is the same instant from a different
@@ -412,6 +430,7 @@ private:
 	float _maxBokehSize = 0.25;			// value 'B', so the max diameter of a circle we're going to walk. In world units of the engine
 	float _focusDelta = 0.0f;			// value 'A', the relationship between stepping over maxBokehSize and the movement of the pixels that have to be in focus. X specific
 
+	bool  _externalTime     = false;	// a camera tool is stepping the clock
 	bool  _autofocusEnabled = false;	// drive _focusDelta from a measured distance instead of the slider
 	float _autofocusPointX = 0.5f;		// where in the frame to focus, 0..1 from the left
 	float _autofocusPointY = 0.5f;		// and from the top. Centre by default, but a face is rarely centred

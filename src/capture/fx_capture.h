@@ -20,7 +20,7 @@
 #pragma pack(push, 4)
 struct FxCaptureBlock {
   uint32_t magic;       // 'SCFX' (0x53434658) — set by the ASI once mapped
-  uint32_t version;     // 12
+  uint32_t version;     // 15
   uint32_t requestId;   // ASI increments to request a capture
   uint32_t ackId;       // addon echoes requestId once handled
   uint32_t status;      // 0 = ok, 1 = capture failed, 2 = file write failed
@@ -83,6 +83,27 @@ struct FxCaptureBlock {
   // without the aperture it was measured at means nothing.
   float    dofLiveFocusDelta;
   float    dofLiveBokeh;
+
+  // --- who owns the clock (v13) -------------------------------------------
+  // Not used by Simple Camera - carried so this struct stays byte-identical
+  // to the add-on's copy and RockstarEditorPlus's. Do not reorder or drop.
+  uint32_t dofExternalTime;
+  uint32_t dofSampleTotal;
+
+  // Not used by Simple Camera - carried for layout parity.
+  uint32_t dofSampleIndex;
+
+  // --- copy the session's focus onto the marker (v15) ---------------------
+  //
+  // addon -> ASI: bumped by "Copy to keyframe" in the depth-of-field panel.
+  // The ASI edge-detects a change and writes dofLiveFocusDelta onto the marker
+  // the editor is sitting on, converting from the session's own aperture to the
+  // render aperture first - the delta is a disparity, so the raw number means a
+  // different plane at a different bokeh size.
+  //
+  // A COUNTER, not a flag: a second press is never swallowed, and neither side
+  // has to clear a write the other one made.
+  uint32_t dofCopyRequest;
 };
 #pragma pack(pop)
 
