@@ -1115,12 +1115,6 @@ static void RebuildSeqRender() {
       char b[8]; sprintf_s(b, "%d", g_RenderJpegQuality); return std::string(b);
     };
   }
-  g_SeqRender.AddList("Color Channels", &g_RenderChannelOrder,
-                      {"Auto", "RGBA", "BGRA"},
-                      [](int) { FxCapture_SetChannelOrder(g_RenderChannelOrder); },
-                      "Fix red/blue-inverted output (orange sky). Auto detects the "
-                      "game's buffer format; force RGBA or BGRA if colors come out "
-                      "wrong.");
   // (The old "World Slow-mo" override slider was removed: capture time scale
   // is always AUTO now — the self-tuning controller always picks a safe value,
   // and every hand-set fixed scale could only match it or break sync.)

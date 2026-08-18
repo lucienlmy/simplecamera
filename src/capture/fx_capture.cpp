@@ -77,13 +77,6 @@ void FxCapture_SetHighlightBoost(float boost) {
   s_block->highlightBoost = boost;
 }
 
-void FxCapture_SetChannelOrder(int order) {
-  if (!s_block)
-    return;
-  if (order < 0 || order > 2) order = 0;
-  s_block->channelOrder = (uint32_t)order;
-}
-
 bool FxCapture_RequestFrame(const char *fullPath) {
   return FxCapture_RequestSample(fullPath, 1, 0);
 }

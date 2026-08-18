@@ -44,7 +44,6 @@ extern int g_RenderBlurSamples;
 extern int g_RenderFormat;
 extern int g_RenderJpegQuality;
 extern float g_RenderHighlightBoost;
-extern int g_RenderChannelOrder;
 // Optional render time range (seconds). Render only [start, end] of the
 // sequence; end <= 0 (or <= start) means "to the end". Lets you re-render just a
 // section. Frame numbering still starts at 0.

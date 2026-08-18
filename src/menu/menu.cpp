@@ -502,10 +502,6 @@ int g_RenderJpegQuality = 90;  // JPEG quality 1..100
 // (The former g_RenderSlowmo fixed-time-scale override is gone: the capture
 // time scale is always AUTO-managed inside ProcessRenderToImages.)
 float g_RenderHighlightBoost = 0.3f; // 0..0.99 вЂ” highlight lift in blur accumulation
-int g_RenderChannelOrder = 0;  // captured channel order: 0 = Auto (addon
-                                      // detects the back-buffer format), 1 = RGBA,
-                                      // 2 = BGRA. Fixes red/blue-inverted output
-                                      // on swapchains the fixed order guessed wrong.
 float g_RenderRangeStart = 0.0f; // render range start (s); 0 = sequence start
 float g_RenderRangeEnd = 0.0f;   // render range end (s); <=0 / <=start = to end
 
@@ -596,7 +592,6 @@ void ProcessRenderToImages() {
 
   FxCapture_SetQuality(g_RenderJpegQuality);
   FxCapture_SetHighlightBoost(g_RenderHighlightBoost);
-  FxCapture_SetChannelOrder(g_RenderChannelOrder);
   const char *ext = (g_RenderFormat == 1) ? "jpg" : "png";
 
   bool cancelled = false;

@@ -192,9 +192,14 @@ that shader, so leaving it off produces black or missing frames. The menu warns
 if the add-on is absent.
 
 **Render to Images…** sets output FPS, flush frames, motion blur samples (up to
-128), highlight boost, format (PNG or JPEG + quality), optional world slow-mo,
-and colour channel order. Leave channels on **Auto**; force RGBA or BGRA only if
-frames come out with red and blue swapped.
+128), highlight boost, and format (PNG or JPEG + quality).
+
+There used to be a **Colour Channels** row here for frames that came out with red
+and blue swapped. It is gone, and so is the problem: the add-on asked ReShade for
+the finished frame, and ReShade hands the channels back in a different order
+depending on its own version, so the order had to be corrected by hand on some
+installs. The add-on copies the back buffer itself now and reads the order from
+the buffer's own description, which cannot disagree with itself.
 
 **How it works.** The sequence genuinely *plays* at a slow time scale, so camera,
 world, shake and effect events all advance on the same game clock. A frame is
