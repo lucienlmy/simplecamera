@@ -56,6 +56,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <vector>
 
 using namespace reshade::api;
@@ -65,9 +66,10 @@ using namespace reshade::api;
 //
 //  The Simple Camera ASI requests frame grabs over a named shared-memory
 //  block (both DLLs live in GTA5.exe). On each present we check the request
-//  counter; if it changed, grab the back buffer via ReShade's backend-
-//  agnostic capture_screenshot(), pack RGBA->RGB and write a PNG with fpng
-//  (same path ScreenshotController uses), then echo the counter back.
+//  counter; if it changed, copy the back buffer into a readback texture of our
+//  own, decode it in whatever format the swapchain actually is, and write a PNG
+//  or JPEG. See the frame readback section below for why the copy is done here
+//  rather than through capture_screenshot().
 //  Layout MUST match fx_capture.h in the ASI project.
 // ============================================================
 #pragma pack(push, 4)
@@ -86,9 +88,21 @@ struct SC_FxCaptureBlock
 	float    highlightBoost; // 0..~1 — extra highlight lift in linear accumulation
 	uint32_t addonHeartbeat; // we bump this every present so the ASI knows we're loaded
 	char outPath[512];
-	uint32_t channelOrder;  // 0 = Auto (detect back-buffer format), 1 = force RGBA,
-	                        // 2 = force BGRA. Appended LAST so mismatched ASI/addon
-	                        // versions keep all earlier fields at the same offset.
+	// DEAD SLOT. Was channelOrder, which told the add-on which order to read the
+	// back buffer's colour channels in.
+	//
+	// Kept, rather than deleted, purely to hold the offsets of everything below
+	// it. THREE binaries map this block - this ASI, Simple Camera and the add-on
+	// - and they do not ship in lockstep, so taking four bytes out of the middle
+	// would silently shift every field after it and corrupt autofocus and the
+	// depth-of-field handshake on any mismatched pair.
+	//
+	// It existed because the add-on asked ReShade for the finished frame, and
+	// ReShade returns the channels in a different order depending on its own
+	// version. The add-on copies the back buffer itself now and takes the order
+	// from the resource description, which cannot disagree with itself, so there
+	// is no longer anything to choose. Written by nobody, read by nobody.
+	uint32_t reserved_wasChannelOrder;
 
 	// --- autofocus for the depth-of-field session (v7) --------------------
 	// Appended for the same reason. We publish what we want focused; the ASI
@@ -183,6 +197,37 @@ static SC_FxCaptureBlock* g_scFxBlock = nullptr;
 static uint32_t g_scFxLastSeen = 0;
 static bool g_scFxFpngInit = false;
 
+// Where the depth-of-field bridge is in its cycle. At file scope, rather than
+// inside sc_fxDofTick where it used to live, because the capture path has to
+// see it: a finished pass is read out of the accumulator it was built in, not
+// off the screen.
+//
+// The phase ITSELF, not a flag copied out of it. sc_fxDofTick returns early in
+// several places - no shared block yet, and the seq == 0 teardown that ends
+// every render - and a mirror updated at the bottom of the function is skipped
+// by exactly those paths. It would then still read "a pass is ready" into the
+// next render, which is the one that has no depth of field at all.
+enum class SC_FxDofPhase { Idle, WaitSetup, WaitRender, Delivered };
+static SC_FxDofPhase g_scFxDofPhase = SC_FxDofPhase::Idle;
+
+// The readback texture, kept between captures rather than allocated per shot.
+// A render asks for 64 of these per output frame at the default sample count.
+static reshade::api::resource g_scFxStage = {};
+static uint32_t g_scFxStageW = 0;
+static uint32_t g_scFxStageH = 0;
+static reshade::api::format g_scFxStageFmt = reshade::api::format::unknown;
+
+// The swapchain, kept for its colour space alone. An effect_runtime is NOT a
+// swapchain in this API version, so the pointer is caught at init_swapchain and
+// matched by window before it is trusted - nothing promises there is only one.
+static reshade::api::swapchain* g_scFxSwapchain = nullptr;
+
+// Defined below g_depthOfFieldController. Anything touching the controller has
+// to live down there - see the note on sc_fxAutofocusTick - but the readback
+// needs these two numbers to resolve the accumulator, so they come up as calls.
+static float sc_fxDofHighlightBoost();
+static float sc_fxDofHighlightGamma();
+
 // Motion-blur accumulation buffer (CPU). We accumulate in LINEAR light (not
 // sRGB) so highlights keep their energy and streak bright instead of being
 // averaged down to grey — optionally with an extra highlight lift. Floats so
@@ -258,6 +303,469 @@ static uint32_t sc_fxWriteImage(const char* path, const uint8_t* rgb, uint32_t w
 	return 0;
 }
 
+// sRGB(0..1) -> linear, for sources with more than 8 bits per channel, where
+// the 256-entry table has nothing to say.
+static inline float sc_fxSrgb2LinF(float c)
+{
+	if (c <= 0.0f) return 0.0f;
+	return (c <= 0.04045f) ? (c / 12.92f)
+	                       : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// A value already in the output encoding -> 8 bits. Used by the depth-of-field
+// resolve, which lands in display space and so must NOT be sent back through a
+// linear round trip just to be quantised.
+static inline uint8_t sc_fxUnitToByte(float v)
+{
+	if (v <= 0.0f) return 0;
+	if (v >= 1.0f) return 255;
+	return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+// IEEE half -> float, in integers. An fp16 back buffer has to be decoded on
+// every pixel of every sample and there is no guarantee of F16C on the machines
+// this runs on.
+static inline float sc_fxHalfToFloat(uint16_t hv)
+{
+	const uint32_t sign = (uint32_t)(hv & 0x8000u) << 16;
+	const uint32_t exp  = (uint32_t)(hv >> 10) & 0x1Fu;
+	const uint32_t mant = (uint32_t)hv & 0x3FFu;
+
+	uint32_t bits;
+	if (exp == 0)
+	{
+		if (mant == 0)
+		{
+			bits = sign;                                    // +-0
+		}
+		else
+		{
+			uint32_t e = 0, m = mant;                       // subnormal: normalise
+			while ((m & 0x400u) == 0) { m <<= 1; ++e; }
+			bits = sign | ((113u - e) << 23) | ((m & 0x3FFu) << 13);
+		}
+	}
+	else if (exp == 31)
+	{
+		bits = sign | 0x7F800000u | (mant << 13);           // Inf / NaN
+	}
+	else
+	{
+		bits = sign | ((exp + 112u) << 23) | (mant << 13);
+	}
+
+	float f;
+	std::memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+// SMPTE ST 2084 (PQ) -> linear, normalised so 1.0 is graphics white. 203 nits
+// is the reference HDR10 signalling assumes for SDR-referred content, so it is
+// what makes an HDR10 capture line up with an SDR one of the same scene.
+static inline float sc_fxPqToLinear(float e)
+{
+	const float m1 = 0.1593017578125f, m2 = 78.84375f;
+	const float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+	const float p = powf(e < 0.0f ? 0.0f : e, 1.0f / m2);
+	const float n = fmaxf(p - c1, 0.0f) / fmaxf(c2 - c3 * p, 1e-6f);
+	return powf(n, 1.0f / m1) * (10000.0f / 203.0f);
+}
+
+// ===========================================================================
+//  Frame readback
+// ===========================================================================
+//  This does the copy itself instead of calling capture_screenshot(). The GPU
+//  work is identical - look at runtime::get_texture_data(): readback-heap
+//  staging texture, barrier, copy_texture_region, fence, map. What differs is
+//  the thirty lines at the end where the bytes get interpreted, and those
+//  thirty lines are NOT stable across ReShade versions:
+//
+//    6.5 and earlier   get_texture_data(res, state, pixels)
+//                      a BGRA back buffer is ALWAYS flipped to RGBA, and a
+//                      10-bit SDR one is quantised to 8 bits on the way out.
+//    6.7 and later     get_texture_data(res, state, pixels, quantization_format)
+//                      and capture_screenshot passes _back_buffer_format, so
+//                      quantization == intermediate, the memcpy branch wins and
+//                      the bytes stay in the back buffer own order.
+//
+//  So the channel order capture_screenshot() returns depends on which ReShade
+//  the user installed. That is what the old auto-detect was really guessing at,
+//  and why "colours swapped? try channelOrder 1, then 2" had to be a
+//  user-facing setting at all. Reading our own staging copy removes the guess:
+//  the bytes are in the format get_resource_desc() states outright.
+//
+//  It settles the precision question at the same time. A float back buffer was
+//  refused here outright, and a 10-bit one arrived pre-truncated; neither was a
+//  limit of the copy, only of that conversion step.
+// ===========================================================================
+
+// What is being read, which decides how the bytes mean anything.
+enum class SC_FxSource
+{
+	BackBuffer,      // the swapchain; encoding follows its colour space
+	DofAccumulator,  // IgcsDof.fx texBlendAccumulate: rgb = weighted sum, a = weight
+};
+
+// One decoded frame. Exactly one buffer is filled: srgb8 when the caller wanted
+// finished pixels, linear when accumulation needs the headroom.
+struct SC_FxFrame
+{
+	std::vector<uint8_t> srgb8;    // tight RGB, w*h*3
+	std::vector<float>   linear;   // linear light, w*h*3, may exceed 1.0
+	uint32_t w = 0;
+	uint32_t h = 0;
+	bool     clipped = true;       // source was fixed-point, so it clipped at white
+};
+
+static void sc_fxReleaseStage(reshade::api::device* dev)
+{
+	if (g_scFxStage != 0 && dev != nullptr)
+	{
+		dev->destroy_resource(g_scFxStage);
+	}
+	g_scFxStage = {};
+	g_scFxStageW = 0;
+	g_scFxStageH = 0;
+	g_scFxStageFmt = reshade::api::format::unknown;
+}
+
+// The IgcsDof.fx accumulation target, or a zero handle when the effect is not
+// loaded. Effect handles die on a reload, so this is resolved per capture
+// rather than cached.
+static reshade::api::resource sc_fxDofAccumResource(effect_runtime* runtime)
+{
+	using namespace reshade::api;
+
+	device* const dev = runtime->get_device();
+	if (dev == nullptr)
+	{
+		return resource{};
+	}
+
+	const effect_texture_variable var = runtime->find_texture_variable("IgcsDof.fx", "texBlendAccumulate");
+	if (var == 0)
+	{
+		return resource{};
+	}
+
+	resource_view srv = {}, srvSrgb = {};
+	runtime->get_texture_binding(var, &srv, &srvSrgb);
+	if (srv == 0)
+	{
+		return resource{};
+	}
+	return dev->get_resource_from_view(srv);
+}
+
+static bool sc_fxReadResource(effect_runtime* runtime,
+                              reshade::api::resource src,
+                              reshade::api::resource_usage srcState,
+                              SC_FxSource kind,
+                              bool wantLinear,
+                              SC_FxFrame& out)
+{
+	using namespace reshade::api;
+
+	device* const dev = runtime->get_device();
+	if (dev == nullptr || src == 0)
+	{
+		return false;
+	}
+
+	const resource_desc srcDesc = dev->get_resource_desc(src);
+	const format   fmt = format_to_default_typed(srcDesc.texture.format, 0);
+	const uint32_t w   = srcDesc.texture.width;
+	const uint32_t h   = srcDesc.texture.height;
+	if (w == 0 || h == 0 || fmt == format::unknown)
+	{
+		return false;
+	}
+
+	const bool is8   = (fmt == format::r8g8b8a8_unorm || fmt == format::b8g8r8a8_unorm ||
+	                    fmt == format::r8g8b8x8_unorm || fmt == format::b8g8r8x8_unorm);
+	const bool is10  = (fmt == format::r10g10b10a2_unorm || fmt == format::b10g10r10a2_unorm);
+	const bool isF16 = (fmt == format::r16g16b16a16_float);
+	const bool isF32 = (fmt == format::r32g32b32a32_float);
+	const bool bgr   = (fmt == format::b8g8r8a8_unorm || fmt == format::b8g8r8x8_unorm ||
+	                    fmt == format::b10g10r10a2_unorm);
+
+	const bool usable = (kind == SC_FxSource::DofAccumulator) ? isF32 : (is8 || is10 || isF16);
+	if (!usable)
+	{
+		static format moaned = format::unknown;
+		if (moaned != fmt)
+		{
+			moaned = fmt;
+			char msg[192];
+			snprintf(msg, sizeof(msg),
+				"FxCapture: source format %u is not one this can read - capture skipped.",
+				(uint32_t)fmt);
+			reshade::log::message(reshade::log::level::error, msg);
+		}
+		return false;
+	}
+
+	// PQ only applies to the swapchain; the accumulator is never HDR10.
+	const bool pq = (is10 && kind == SC_FxSource::BackBuffer &&
+	                 g_scFxSwapchain != nullptr &&
+	                 g_scFxSwapchain->get_hwnd() == runtime->get_hwnd() &&
+	                 g_scFxSwapchain->get_color_space() == color_space::hdr10_st2084);
+
+	// Say what is being read, once per change. Channel order and precision are
+	// both decided here and are otherwise invisible - a swapped or truncated
+	// render and a correct one differ by nothing a log would normally show.
+	{
+		static format      loggedFmt  = format::unknown;
+		static SC_FxSource loggedKind = SC_FxSource::BackBuffer;
+		static bool        everLogged = false;
+		if (!everLogged || loggedFmt != fmt || loggedKind != kind)
+		{
+			everLogged = true;
+			loggedFmt  = fmt;
+			loggedKind = kind;
+			char msg[256];
+			snprintf(msg, sizeof(msg),
+				"FxCapture: reading %s - format %u, %s, %s",
+				(kind == SC_FxSource::DofAccumulator) ? "the IgcsDof accumulator" : "the back buffer",
+				(uint32_t)fmt,
+				bgr ? "BGRA order" : "RGBA order",
+				isF32 ? "32-bit float"
+				: isF16 ? "16-bit float (scRGB)"
+				: pq    ? "10-bit PQ (HDR10)"
+				: is10  ? "10-bit"
+				        : "8-bit");
+			reshade::log::message(reshade::log::level::info, msg);
+		}
+	}
+
+	if (g_scFxStage != 0 && (g_scFxStageW != w || g_scFxStageH != h || g_scFxStageFmt != fmt))
+	{
+		sc_fxReleaseStage(dev);
+	}
+	if (g_scFxStage == 0)
+	{
+		if (!dev->create_resource(resource_desc(w, h, 1, 1, fmt, 1, memory_heap::gpu_to_cpu, resource_usage::copy_dest),
+		                          nullptr, resource_usage::copy_dest, &g_scFxStage))
+		{
+			reshade::log::message(reshade::log::level::error,
+				"FxCapture: could not create the readback texture.");
+			g_scFxStage = {};
+			return false;
+		}
+		dev->set_resource_name(g_scFxStage, "RE+ capture readback");
+		g_scFxStageW   = w;
+		g_scFxStageH   = h;
+		g_scFxStageFmt = fmt;
+	}
+
+	command_queue* const queue = runtime->get_command_queue();
+	if (queue == nullptr)
+	{
+		return false;
+	}
+	command_list* const cmd = queue->get_immediate_command_list();
+	if (cmd == nullptr)
+	{
+		return false;
+	}
+
+	cmd->barrier(src, srcState, resource_usage::copy_source);
+	cmd->copy_texture_region(src, 0, nullptr, g_scFxStage, 0, nullptr);
+	cmd->barrier(src, resource_usage::copy_source, srcState);
+
+	// Wait for the copy, the same way ReShade does: a fence where the backend
+	// has them, a queue drain where it does not. signal() flushes the immediate
+	// command list, so the copy above is submitted by this point.
+	fence copySync = {};
+	if (!dev->create_fence(0, fence_flags::none, &copySync) ||
+	    !queue->signal(copySync, 1) || !dev->wait(copySync, 1))
+	{
+		queue->wait_idle();
+	}
+	if (copySync != 0)
+	{
+		dev->destroy_fence(copySync);
+	}
+
+	subresource_data mapped = {};
+	if (!dev->map_texture_region(g_scFxStage, 0, nullptr, map_access::read_only, &mapped) ||
+	    mapped.data == nullptr)
+	{
+		reshade::log::message(reshade::log::level::error, "FxCapture: could not map the readback texture.");
+		return false;
+	}
+
+	out.w = w;
+	out.h = h;
+	out.clipped = !(isF16 || isF32);
+	if (wantLinear)
+	{
+		out.linear.resize((size_t)w * h * 3);
+	}
+	else
+	{
+		out.srgb8.resize((size_t)w * h * 3);
+	}
+
+	if (!g_scFxLutReady)
+	{
+		sc_fxBuildLut();
+	}
+
+	// The depth-of-field resolve, mirroring the tail of IGCSCS() in IgcsDof.fx.
+	const float hb    = sc_fxDofHighlightBoost();
+	const float hg    = sc_fxDofHighlightGamma();
+	const float invHg = (hg > 0.0001f) ? (1.0f / hg) : 1.0f;
+	const float ck    = 0.4f * 0.33f;                 // ConeOverlapInverse
+	const float cd    = 3.0f * ck - 1.0f;
+	const float cx    = (ck - 1.0f) / cd;
+	const float cy    = ck / cd;
+
+	// BT.2020 -> BT.709, for an HDR10 source.
+	const float m00 =  1.6605f, m01 = -0.5876f, m02 = -0.0728f;
+	const float m10 = -0.1246f, m11 =  1.1329f, m12 = -0.0083f;
+	const float m20 = -0.0182f, m21 = -0.1006f, m22 =  1.1187f;
+
+	// Rows are walked one at a time because a readback row pitch is NOT
+	// width * bpp - D3D12 aligns rows to 256 bytes.
+	const uint8_t* row = static_cast<const uint8_t*>(mapped.data);
+
+	for (uint32_t y = 0; y < h; ++y, row += mapped.row_pitch)
+	{
+		const size_t o = (size_t)y * w * 3;
+
+		if (is8)
+		{
+			const uint32_t ri = bgr ? 2u : 0u;
+			const uint32_t bi = bgr ? 0u : 2u;
+			if (wantLinear)
+			{
+				for (uint32_t x = 0; x < w; ++x)
+				{
+					out.linear[o + 3 * x + 0] = g_scFxSrgb2Lin[row[4 * x + ri]];
+					out.linear[o + 3 * x + 1] = g_scFxSrgb2Lin[row[4 * x + 1]];
+					out.linear[o + 3 * x + 2] = g_scFxSrgb2Lin[row[4 * x + bi]];
+				}
+			}
+			else
+			{
+				// Straight through: no conversion at all, so an 8-bit single
+				// shot is byte-for-byte what the swapchain held.
+				for (uint32_t x = 0; x < w; ++x)
+				{
+					out.srgb8[o + 3 * x + 0] = row[4 * x + ri];
+					out.srgb8[o + 3 * x + 1] = row[4 * x + 1];
+					out.srgb8[o + 3 * x + 2] = row[4 * x + bi];
+				}
+			}
+			continue;
+		}
+
+		for (uint32_t x = 0; x < w; ++x)
+		{
+			float r = 0.0f, g = 0.0f, b = 0.0f;
+			bool  display = false;   // r/g/b are already in the output encoding
+
+			if (is10)
+			{
+				uint32_t v = 0;
+				std::memcpy(&v, row + 4 * x, sizeof(v));
+				const float c0 = (float)( v         & 0x3FFu) / 1023.0f;
+				const float c1 = (float)((v >> 10)  & 0x3FFu) / 1023.0f;
+				const float c2 = (float)((v >> 20)  & 0x3FFu) / 1023.0f;
+				r = bgr ? c2 : c0;
+				g = c1;
+				b = bgr ? c0 : c2;
+				if (pq)
+				{
+					const float lr = sc_fxPqToLinear(r);
+					const float lg = sc_fxPqToLinear(g);
+					const float lb = sc_fxPqToLinear(b);
+					r = m00 * lr + m01 * lg + m02 * lb;
+					g = m10 * lr + m11 * lg + m12 * lb;
+					b = m20 * lr + m21 * lg + m22 * lb;
+				}
+				else
+				{
+					r = sc_fxSrgb2LinF(r);
+					g = sc_fxSrgb2LinF(g);
+					b = sc_fxSrgb2LinF(b);
+				}
+			}
+			else if (isF16)
+			{
+				uint16_t hv[4];
+				std::memcpy(hv, row + 8 * x, sizeof(hv));
+				// scRGB is already LINEAR with Rec.709 primaries and 1.0 at SDR
+				// white. Above 1 are the highlights an 8-bit capture threw away
+				// - the entire reason for reading this format. Below 0 is
+				// out-of-gamut and has no meaning on the way to an 8-bit file.
+				r = sc_fxHalfToFloat(hv[0]);
+				g = sc_fxHalfToFloat(hv[1]);
+				b = sc_fxHalfToFloat(hv[2]);
+			}
+			else
+			{
+				// The depth-of-field accumulator: rgb is the weighted sum and a
+				// is the summed weight, exactly as IgcsDof.fx left it. Its own
+				// resolve writes RGB10A2 and that then lands in an 8-bit back
+				// buffer, so reading the screen threw away two quantisations of
+				// a 32-bit float accumulation. The dither the shader adds after
+				// this is deliberately NOT reproduced - it exists to hide 8-bit
+				// banding on screen, and nothing here is 8-bit yet.
+				float px[4];
+				std::memcpy(px, row + 16 * x, sizeof(px));
+				if (px[3] > 1e-6f)
+				{
+					const float iw = 1.0f / px[3];
+					float tr = px[0] * iw, tg = px[1] * iw, tb = px[2] * iw;
+
+					tr = tr / (1.001f + hb * tr);
+					tg = tg / (1.001f + hb * tg);
+					tb = tb / (1.001f + hb * tb);
+
+					tr = powf(tr < 0.0f ? 0.0f : tr, invHg);
+					tg = powf(tg < 0.0f ? 0.0f : tg, invHg);
+					tb = powf(tb < 0.0f ? 0.0f : tb, invHg);
+
+					r = tr * cx + tg * cy + tb * cy;
+					g = tr * cy + tg * cx + tb * cy;
+					b = tr * cy + tg * cy + tb * cx;
+				}
+				display = true;   // the resolve lands in the back buffer encoding
+			}
+
+			if (wantLinear)
+			{
+				if (display)
+				{
+					r = sc_fxSrgb2LinF(r);
+					g = sc_fxSrgb2LinF(g);
+					b = sc_fxSrgb2LinF(b);
+				}
+				out.linear[o + 3 * x + 0] = r < 0.0f ? 0.0f : r;
+				out.linear[o + 3 * x + 1] = g < 0.0f ? 0.0f : g;
+				out.linear[o + 3 * x + 2] = b < 0.0f ? 0.0f : b;
+			}
+			else if (display)
+			{
+				out.srgb8[o + 3 * x + 0] = sc_fxUnitToByte(r);
+				out.srgb8[o + 3 * x + 1] = sc_fxUnitToByte(g);
+				out.srgb8[o + 3 * x + 2] = sc_fxUnitToByte(b);
+			}
+			else
+			{
+				out.srgb8[o + 3 * x + 0] = sc_fxLin2Srgb8(r);
+				out.srgb8[o + 3 * x + 1] = sc_fxLin2Srgb8(g);
+				out.srgb8[o + 3 * x + 2] = sc_fxLin2Srgb8(b);
+			}
+		}
+	}
+
+	dev->unmap_texture_region(g_scFxStage, 0);
+	return true;
+}
+
 static void sc_fxCaptureTick(effect_runtime* runtime)
 {
 	// Lazily map the shared block (the ASI may map it first, or we do).
@@ -288,10 +796,23 @@ static void sc_fxCaptureTick(effect_runtime* runtime)
 	g_scFxBlock->addonHeartbeat++;
 
 	const uint32_t req = g_scFxBlock->requestId;
+
+	// Hand the readback texture back once nothing is capturing. It is sized by
+	// whatever it last read, and the depth-of-field accumulator is sixteen bytes
+	// a pixel - 132MB at 4K - which is not something to sit on for an evening of
+	// play because one render happened at lunchtime. Ten seconds or so of quiet,
+	// then it goes; the next capture just makes another one.
+	static uint32_t s_idlePresents = 0;
 	if (req == g_scFxLastSeen)
 	{
+		if (g_scFxStage != 0 && ++s_idlePresents > 600)
+		{
+			sc_fxReleaseStage(runtime->get_device());
+			s_idlePresents = 0;
+		}
 		return; // nothing requested
 	}
+	s_idlePresents = 0;
 	g_scFxLastSeen = req;
 
 	const uint32_t sampleCount = (g_scFxBlock->sampleCount < 1) ? 1 : g_scFxBlock->sampleCount;
@@ -306,232 +827,120 @@ static void sc_fxCaptureTick(effect_runtime* runtime)
 		return;
 	}
 
-	// The back buffer FORMAT decides two separate things - how many bytes
-	// capture_screenshot is going to write, and what order the channels arrive
-	// in - so it is read once, before anything is sized.
-	reshade::api::format bbFormat = reshade::api::format::unknown;
-	if (reshade::api::device *const dev = runtime->get_device())
+	// Where the pixels come from. A finished depth-of-field pass is read out of
+	// the float accumulator it was built in; everything else off the back buffer.
+	reshade::api::resource       src      = {};
+	reshade::api::resource_usage srcState = reshade::api::resource_usage::present;
+	SC_FxSource                  kind     = SC_FxSource::BackBuffer;
+
+	if (g_scFxDofPhase == SC_FxDofPhase::Delivered)
 	{
-		const reshade::api::resource bb = runtime->get_current_back_buffer();
-		if (bb != 0)
+		const reshade::api::resource acc = sc_fxDofAccumResource(runtime);
+		if (acc != 0)
 		{
-			// format_to_default_typed first: ReShade promotes x8 to a8 before
-			// storing _back_buffer_format, and a raw compare would miss b8g8r8x8.
-			bbFormat = reshade::api::format_to_default_typed(
-				dev->get_resource_desc(bb).texture.format, 0);
+			src      = acc;
+			srcState = reshade::api::resource_usage::shader_resource;
+			kind     = SC_FxSource::DofAccumulator;
 		}
 	}
-
-	// SIZE THE BUFFER BY THE FORMAT, not by a hardcoded four.
-	//
-	// The API contract is explicit: "Pointer to an array of width * height * bpp
-	// bytes ... where bpp is the number of bytes per pixel of the BACK BUFFER
-	// FORMAT". A fixed 4 is only correct while the swapchain is 8-bit.
-	//
-	// On an HDR swapchain it is not. r16g16b16a16_float is EIGHT bytes per pixel,
-	// so a width*height*4 buffer is overrun by exactly its own length - a heap
-	// corruption that depends on the user's display settings and would surface
-	// as a crash somewhere else entirely. Enabling HDR is all it takes.
-	const uint32_t bpp = reshade::api::format_row_pitch(bbFormat, 1);
-
-	// Say what was detected, once. The whole channel-order question is decided
-	// by this number and it is otherwise invisible - a swapped render and a
-	// correct one differ by nothing a log would normally show. It also answers
-	// "do the DX11 and DX12 builds differ" by observation instead of by
-	// argument, which is the only way that question stays answered.
+	if (src == 0)
 	{
-		static reshade::api::format loggedFormat = reshade::api::format::unknown;
-		static bool everLogged = false;
-		if (!everLogged || bbFormat != loggedFormat)
-		{
-			everLogged = true;
-			loggedFormat = bbFormat;
-			char msg[192];
-			snprintf(msg, sizeof(msg),
-				"FxCapture: back buffer format %u, %u byte(s)/pixel - capture reads %s",
-				static_cast<uint32_t>(bbFormat), bpp,
-				(bbFormat == reshade::api::format::b8g8r8a8_unorm ||
-				 bbFormat == reshade::api::format::b8g8r8x8_unorm) ? "BGRA"
-				: (bbFormat == reshade::api::format::r10g10b10a2_unorm ||
-				   bbFormat == reshade::api::format::b10g10r10a2_unorm) ? "packed 10-bit"
-				: (bpp == 4) ? "RGBA" : "an unsupported layout");
-			reshade::log::message(reshade::log::level::info, msg);
-		}
+		src  = runtime->get_current_back_buffer();
+		kind = SC_FxSource::BackBuffer;
 	}
-
-	if (bpp == 0)
+	if (src == 0)
 	{
-		static bool warnedFormat = false;
-		if (!warnedFormat)
-		{
-			warnedFormat = true;
-			reshade::log::message(reshade::log::level::error,
-				"FxCapture: could not determine the back buffer format; capture disabled.");
-		}
 		g_scFxBlock->status = 1;
-		g_scFxBlock->ackId = req;
+		g_scFxBlock->ackId  = req;
 		return;
 	}
 
-	std::vector<uint8_t> shot(static_cast<size_t>(width) * height * bpp);
-	runtime->capture_screenshot(shot.data());
+	// Linear floats are only needed when samples get summed. A single shot comes
+	// back in its final form, which on an 8-bit swapchain means the bytes are
+	// never converted at all.
+	const bool wantLinear = (sampleCount > 1);
 
-	// Does capture_screenshot() hand back RGBA or BGRA? It depends on the
-	// SWAPCHAIN, and it is knowable rather than guessable.
-	//
-	// The addon API returns the back buffer's OWN channel order. Its header says
-	// so - "bpp is the number of bytes per pixel of the back buffer format" - and
-	// runtime.cpp shows why:
-	//
-	//     bool capture_screenshot(void *pixels) final {
-	//         return get_texture_data(..., _back_buffer_format);
-	//     }
-	//
-	// get_texture_data only converts when asked for a DIFFERENT output format:
-	//
-	//     if (quantization_format == intermediate_format)
-	//         -> straight copy, no conversion
-	//     if (quantization_format == api::format::r8g8b8a8_unorm)
-	//         case api::format::b8g8r8a8_unorm:
-	//             // Format is BGRA, but output should be RGBA, so flip channels
-	//
-	// capture_screenshot passes the back buffer format as the quantization
-	// format, so on a BGRA swapchain the two are equal, the first branch wins,
-	// and the bytes arrive BGRA. ReShade's own screenshots are correct because
-	// they pass r8g8b8a8_unorm explicitly and therefore DO hit the flip.
-	//
-	// A previous version of this file concluded the opposite - that the flip
-	// always happens - from reading that `case` without the `if` wrapping it,
-	// and hardcoded "never swap". That is correct only on RGBA swapchains. On
-	// GTA V Enhanced it produced a measurable red/blue swap: comparing a render
-	// against a ReShade screenshot of the same scene, the render's R-G matched
-	// the screenshot's B-G and vice versa, and R-B came out +4.01 where an
-	// unswapped capture would have given -3.78.
-	//
-	// So: read the format. format_to_default_typed first, because ReShade
-	// promotes x8 to a8 before storing _back_buffer_format (runtime.cpp:384) and
-	// a raw comparison would miss b8g8r8x8.
-	bool swapRB = false;
-	const uint32_t orderMode = g_scFxBlock->channelOrder;
-	if (orderMode == 1)
+	SC_FxFrame frame;
+	if (!sc_fxReadResource(runtime, src, srcState, kind, wantLinear, frame))
 	{
-		swapRB = false;  // forced RGBA
-	}
-	else if (orderMode == 2)
-	{
-		swapRB = true;   // forced BGRA
-	}
-	else
-	{
-		swapRB = (bbFormat == reshade::api::format::b8g8r8a8_unorm ||
-		          bbFormat == reshade::api::format::b8g8r8x8_unorm ||
-		          bbFormat == reshade::api::format::b10g10r10a2_unorm);
-	}
-
-	// Everything below reads four bytes per pixel, one 8-bit channel each.
-	//
-	// A 10-bit swapchain is also four bytes per pixel but is NOT that layout -
-	// it is three packed 10-bit bitfields plus two bits of alpha, and
-	// capture_screenshot hands it over verbatim because it quantises to the back
-	// buffer's own format. Reading byte 0 as red there is not a channel swap,
-	// it is the bottom eight bits of red mixed with nothing. Unpack it into the
-	// layout the rest of the function expects, in place - the sizes match, so
-	// this costs one pass and no allocation.
-	const bool tenBit = (bbFormat == reshade::api::format::r10g10b10a2_unorm ||
-	                     bbFormat == reshade::api::format::b10g10r10a2_unorm);
-	if (tenBit)
-	{
-		for (uint32_t i = 0; i < width * height; ++i)
+		// Dropping back to the back buffer keeps a depth-of-field render alive
+		// when the accumulator cannot be read: the finished pass is on screen
+		// too, just through the quantisation this path exists to avoid.
+		bool recovered = false;
+		if (kind == SC_FxSource::DofAccumulator)
 		{
-			uint32_t v = 0;
-			std::memcpy(&v, &shot[4 * i], sizeof(v));
-			// >> 2 takes the 10-bit range (0-1023) to 8-bit (0-255), the same
-			// reduction ReShade applies on this path.
-			const uint8_t c0 = static_cast<uint8_t>(( v         & 0x3FFu) >> 2);
-			const uint8_t c1 = static_cast<uint8_t>(((v >> 10)  & 0x3FFu) >> 2);
-			const uint8_t c2 = static_cast<uint8_t>(((v >> 20)  & 0x3FFu) >> 2);
-			// Which end holds red is the same question swapRB already answers,
-			// so a forced order override keeps working here too.
-			shot[4 * i + 0] = swapRB ? c2 : c0;
-			shot[4 * i + 1] = c1;
-			shot[4 * i + 2] = swapRB ? c0 : c2;
-			shot[4 * i + 3] = 0xFF;
+			const reshade::api::resource bb = runtime->get_current_back_buffer();
+			recovered = (bb != 0) &&
+			            sc_fxReadResource(runtime, bb, reshade::api::resource_usage::present,
+			                              SC_FxSource::BackBuffer, wantLinear, frame);
+		}
+		if (!recovered)
+		{
+			g_scFxBlock->status = 1;
+			g_scFxBlock->ackId  = req;
+			return;
 		}
 	}
-	else if (bpp != 4)
-	{
-		// A float or 16-bit-per-channel back buffer - an HDR swapchain. There is
-		// no honest 8-bit answer without tonemapping it, and inventing one here
-		// would silently change what the renderer produces. Refuse loudly.
-		static bool warnedHdr = false;
-		if (!warnedHdr)
-		{
-			warnedHdr = true;
-			reshade::log::message(reshade::log::level::error,
-				"FxCapture: the back buffer is not an 8-bit format (HDR swapchain?); "
-				"capture is disabled. Render in SDR, or turn HDR off for the render.");
-		}
-		g_scFxBlock->status = 1;
-		g_scFxBlock->ackId = req;
-		return;
-	}
 
-	// After the unpack above the data is plain RGBA, so the swap is spent.
-	const uint32_t ri = (swapRB && !tenBit) ? 2u : 0u; // byte index of red
-	const uint32_t bi = (swapRB && !tenBit) ? 0u : 2u; // byte index of blue
-
+	width  = frame.w;
+	height = frame.h;
 	uint32_t status = 0;
 
-	if (sampleCount <= 1)
+	if (!wantLinear)
 	{
-		// Single capture: pack down to tight RGB in the detected order, write.
-		for (uint32_t i = 0; i < width * height; ++i)
-		{
-			const uint8_t r = shot[4 * i + ri];
-			const uint8_t g = shot[4 * i + 1];
-			const uint8_t b = shot[4 * i + bi];
-			shot[3 * i + 0] = r;
-			shot[3 * i + 1] = g;
-			shot[3 * i + 2] = b;
-		}
-		status = sc_fxWriteImage(g_scFxBlock->outPath, shot.data(), width, height, g_scFxBlock->quality);
+		status = sc_fxWriteImage(g_scFxBlock->outPath, frame.srgb8.data(), width, height, g_scFxBlock->quality);
 	}
 	else
 	{
-		// Motion-blur accumulation in LINEAR light, with optional highlight
-		// boost (AccentuateWhites-style: y = x / (1.001 - b*x)). Reset on the
-		// first sample (or if the size changed).
-		if (!g_scFxLutReady) sc_fxBuildLut();
-		const float b = (g_scFxBlock->highlightBoost < 0.0f) ? 0.0f
-		              : (g_scFxBlock->highlightBoost > 0.99f) ? 0.99f
-		                                                      : g_scFxBlock->highlightBoost;
-		const size_t count = static_cast<size_t>(width) * height * 3;
+		// Motion-blur accumulation in LINEAR light, with an optional highlight
+		// lift (AccentuateWhites-style: y = x / (1.001 - b*x)). Reset on the
+		// first sample, or if the size changed under us.
+		const size_t count = (size_t)width * height * 3;
 		if (sampleIndex == 0 || g_scFxAccumW != width || g_scFxAccumH != height)
 		{
 			g_scFxAccum.assign(count, 0.0f);
 			g_scFxAccumW = width;
 			g_scFxAccumH = height;
 		}
-		for (uint32_t i = 0; i < width * height; ++i)
+		if (g_scFxAccum.size() != count || frame.linear.size() != count)
 		{
-			float r = g_scFxSrgb2Lin[shot[4 * i + ri]];
-			float g = g_scFxSrgb2Lin[shot[4 * i + 1]];
-			float bl = g_scFxSrgb2Lin[shot[4 * i + bi]];
-			if (b > 0.0f)
+			g_scFxBlock->status = 1;
+			g_scFxBlock->ackId  = req;
+			return;
+		}
+
+		float b = (g_scFxBlock->highlightBoost < 0.0f) ? 0.0f
+		        : (g_scFxBlock->highlightBoost > 0.99f) ? 0.99f
+		                                                : g_scFxBlock->highlightBoost;
+
+		// The lift is a workaround for a source that CLIPPED its highlights, so
+		// it is applied only to sources that did. On a float back buffer the
+		// energy above white is really there, and lifting it would push it
+		// through the 1/b singularity and compress the very headroom that made
+		// reading the float worth doing in the first place.
+		if (b > 0.0f && !frame.clipped)
+		{
+			static bool saidSo = false;
+			if (!saidSo)
 			{
-				r  = r  / (1.001f - b * r);
-				g  = g  / (1.001f - b * g);
-				bl = bl / (1.001f - b * bl);
+				saidSo = true;
+				reshade::log::message(reshade::log::level::info,
+					"FxCapture: highlight boost skipped - this source keeps its highlights, "
+					"so accumulation does not need the lift.");
 			}
-			g_scFxAccum[3 * i + 0] += r;
-			g_scFxAccum[3 * i + 1] += g;
-			g_scFxAccum[3 * i + 2] += bl;
+			b = 0.0f;
+		}
+
+		for (size_t k = 0; k < count; ++k)
+		{
+			float v = frame.linear[k];
+			if (b > 0.0f) v = v / fmaxf(1.001f - b * v, 0.001f);
+			g_scFxAccum[k] += v;
 		}
 
 		if (sampleIndex >= sampleCount - 1)
 		{
-			// Final sample: average in linear, undo the highlight boost, then
-			// encode back to sRGB.
+			// Final sample: average in linear, undo the lift, encode to sRGB.
 			std::vector<uint8_t> out(count);
 			const float inv = 1.0f / (float)sampleCount;
 			for (size_t k = 0; k < count; ++k)
@@ -575,6 +984,12 @@ static CameraToolsConnector g_cameraToolsConnector;
 static ScreenshotSettings g_screenshotSettings;
 static ScreenshotController g_screenshotController(g_cameraToolsConnector);
 static DepthOfFieldController g_depthOfFieldController(g_cameraToolsConnector);
+
+// The other end of the forward declarations in the capture section. Resolving
+// the depth-of-field accumulator needs the same two numbers the panel pushes
+// into IgcsDof.fx, and the controller is the side that owns them.
+static float sc_fxDofHighlightBoost() { return g_depthOfFieldController.getHighlightBoostFactor(); }
+static float sc_fxDofHighlightGamma() { return g_depthOfFieldController.getHighlightGammaFactor(); }
 static ReshadeStateController g_reshadeStateController;
 static IGCS::ThreadSafeQueue<WorkItem> g_presentWorkQueue;
 static bool g_recordReshadeState = true;
@@ -871,8 +1286,6 @@ static void sc_fxDofTick(effect_runtime* runtime)
 		return;
 	}
 
-	enum class Phase { Idle, WaitSetup, WaitRender, Delivered };
-	static Phase    s_phase   = Phase::Idle;
 	static uint32_t s_seenSeq = 0;
 	static uint32_t s_waited  = 0;
 	static bool     s_lensApplied = false;
@@ -884,10 +1297,10 @@ static void sc_fxDofTick(effect_runtime* runtime)
 	// render is over" and the way it cancels, so one path tears down.
 	if (seq == 0)
 	{
-		if (s_phase != Phase::Idle)
+		if (g_scFxDofPhase != SC_FxDofPhase::Idle)
 		{
 			g_depthOfFieldController.endSession(runtime);
-			s_phase = Phase::Idle;
+			g_scFxDofPhase = SC_FxDofPhase::Idle;
 			g_scFxBlock->dofStatus = 0;
 		}
 		s_seenSeq = 0;
@@ -950,22 +1363,22 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				"and the render would produce plain frames. Enable 'IgcsDOF' on ReShade's "
 				"Home tab and drag it to the bottom of the list, then render again.");
 			g_scFxBlock->dofStatus = 3;
-			s_phase = Phase::Idle;
+			g_scFxDofPhase = SC_FxDofPhase::Idle;
 			return;
 		}
 
 		g_depthOfFieldController.setShutterMs(g_scFxBlock->dofShutterMs);
 		g_depthOfFieldController.startSession(runtime);
-		s_phase = (DepthOfFieldControllerState::Setup == g_depthOfFieldController.getState() ||
+		g_scFxDofPhase = (DepthOfFieldControllerState::Setup == g_depthOfFieldController.getState() ||
 		           DepthOfFieldControllerState::Start == g_depthOfFieldController.getState())
-			? Phase::WaitSetup : Phase::Idle;
-		g_scFxBlock->dofStatus = (s_phase == Phase::WaitSetup) ? 1u : 3u;
+			? SC_FxDofPhase::WaitSetup : SC_FxDofPhase::Idle;
+		g_scFxBlock->dofStatus = (g_scFxDofPhase == SC_FxDofPhase::WaitSetup) ? 1u : 3u;
 		return;
 	}
 
-	switch (s_phase)
+	switch (g_scFxDofPhase)
 	{
-		case Phase::WaitSetup:
+		case SC_FxDofPhase::WaitSetup:
 		{
 			++s_waited;
 			if (DepthOfFieldControllerState::Setup != g_depthOfFieldController.getState())
@@ -974,7 +1387,7 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				if (s_waited > 600)
 				{
 					g_scFxBlock->dofStatus = 3;
-					s_phase = Phase::Idle;
+					g_scFxDofPhase = SC_FxDofPhase::Idle;
 				}
 				break;
 			}
@@ -1098,13 +1511,13 @@ static void sc_fxDofTick(effect_runtime* runtime)
 			if ((afSettled && s_waited >= 3) || s_waited > 600)
 			{
 				g_depthOfFieldController.startRender(runtime);
-				s_phase = Phase::WaitRender;
+				g_scFxDofPhase = SC_FxDofPhase::WaitRender;
 				s_waited = 0;
 			}
 			break;
 		}
 
-		case Phase::WaitRender:
+		case SC_FxDofPhase::WaitRender:
 			if (DepthOfFieldControllerState::Done == g_depthOfFieldController.getState())
 			{
 				// The image is up. Say so and then do nothing - the session is
@@ -1112,17 +1525,44 @@ static void sc_fxDofTick(effect_runtime* runtime)
 				// very frame the renderer is about to capture.
 				g_scFxBlock->dofStatus  = 2;
 				g_scFxBlock->dofDoneSeq = s_seenSeq;
-				s_phase = Phase::Delivered;
+				g_scFxDofPhase = SC_FxDofPhase::Delivered;
 			}
 			else if (DepthOfFieldControllerState::Rendering != g_depthOfFieldController.getState())
 			{
 				g_scFxBlock->dofStatus = 3;   // cancelled or fell over
-				s_phase = Phase::Idle;
+				g_scFxDofPhase = SC_FxDofPhase::Idle;
 			}
 			break;
 
 		default:
 			break;
+	}
+}
+
+
+// Caught only so the capture can ask what colour space the back buffer is in,
+// which is the difference between decoding a 10-bit swapchain as sRGB and
+// decoding it as PQ.
+static void onInitSwapchain(swapchain* sc, bool resize)
+{
+	(void)resize;
+	g_scFxSwapchain = sc;
+}
+
+
+// The readback texture belongs to the device that is going away, so it goes
+// with it. A resize destroys and recreates the swapchain, and holding a stale
+// resource across that is how an add-on takes the game down at alt-enter.
+static void onDestroySwapchain(swapchain* sc, bool resize)
+{
+	(void)resize;
+	if (sc != nullptr)
+	{
+		sc_fxReleaseStage(sc->get_device());
+	}
+	if (g_scFxSwapchain == sc)
+	{
+		g_scFxSwapchain = nullptr;
 	}
 }
 
@@ -2095,6 +2535,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		{
 			return FALSE;
 		}
+		reshade::register_event<reshade::addon_event::init_swapchain>(onInitSwapchain);
+		reshade::register_event<reshade::addon_event::destroy_swapchain>(onDestroySwapchain);
 		reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
 		reshade::register_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
 		reshade::register_event<reshade::addon_event::reshade_begin_effects>(onReshadeBeginEffects);
@@ -2104,6 +2546,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		loadIniFile();
 		break;
 	case DLL_PROCESS_DETACH:
+		reshade::unregister_event<reshade::addon_event::init_swapchain>(onInitSwapchain);
+		reshade::unregister_event<reshade::addon_event::destroy_swapchain>(onDestroySwapchain);
 		reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
 		reshade::unregister_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
 		reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(onReshadeBeginEffects);
